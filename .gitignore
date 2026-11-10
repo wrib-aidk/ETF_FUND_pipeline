@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+# 실행 입력과 결과는 저장소에 넣지 않는다 (샘플은 samples/)
+inbox/*
+!inbox/.gitkeep
+output/*
+!output/.gitkeep
