@@ -60,9 +60,16 @@ def image_files(layer1, embedded=False):
 
 
 def ocr_environment():
-    """setx 이후 열린 기존 셸에서도 사용자 환경값을 가져온다. 값은 출력하지 않는다."""
+    """셸 환경값 > 저장소 루트 .env > Windows 사용자 환경값 순으로 읽는다. 값은 출력하지 않는다."""
     env = os.environ.copy()
     names = ("OCR_API_KEY", "OCR_BASIC_AUTH", "OCR_SERVER")
+    dotenv = ROOT / ".env"
+    if dotenv.exists():
+        for line in dotenv.read_text(encoding="utf-8-sig").splitlines():
+            name, sep, value = line.partition("=")
+            name, value = name.strip(), value.strip().strip('"').strip("'")
+            if sep and name in names and value and not env.get(name):
+                env[name] = value
     if os.name == "nt" and any(not env.get(name) for name in names):
         import winreg
 
@@ -90,7 +97,7 @@ def step(label, script, arguments, outputs, inputs, force, env=None):
         print(f"  {label}: 최신 결과 사용 ({time.perf_counter() - started:.1f}s)", flush=True)
         return
     # 인증은 실제 서버 요청이 필요한 경우에만 확인한다.
-    if script == "ocr_pages_server.py":
+    if Path(script).name == "ocr_pages_server.py":
         env = ocr_environment()
     child_env = dict(os.environ if env is None else env, PYTHONIOENCODING="utf-8")
     print(f"  {label}: 실행", flush=True)

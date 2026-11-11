@@ -7,3 +7,4 @@ inbox/*
 !inbox/.gitkeep
 output/*
 !output/.gitkeep
+validation/

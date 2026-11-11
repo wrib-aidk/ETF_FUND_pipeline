@@ -1122,7 +1122,12 @@ def document_info(nodes, tables):
                 return
 
     first("fund_code", r"펀드\s*코드\s*[:：]?\s*([A-Z0-9]{4,})")
-    first("as_of_date", r"작성\s*기준일\s*[:：]?\s*(\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2})")
+    date_pattern = r"(\d{4}\s*[.\-/년]\s*\d{1,2}\s*[.\-/월]\s*\d{1,2}(?:\s*일)?)"
+    first("as_of_date", r"작성\s*기준일\s*[:：]?\s*" + date_pattern)
+    if "as_of_date" not in info:
+        # An unqualified summary date is a document date; compound labels such
+        # as 심사기준일 and 분배금 지급기준일 must never match this fallback.
+        first("as_of_date", r"(?:<\s*요약정보\s*>\s*\(?|^\s*[\[(]?)기준일\s*[:：]\s*" + date_pattern)
     first("doc_type", r"((?:간이)?투자설명서)", pages=2)
     names = Counter()
     for page, text in texts:

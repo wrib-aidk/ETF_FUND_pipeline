@@ -316,6 +316,191 @@ def pieces_in(pieces, box, exclude=()):
             and not any(base.inside(other, *base.center(p["bbox"])) for other in exclude)]
 
 
+def split_merged_headers(cells, xs, pieces):
+    """Split only independently aligned OCR columns above an actual value row.
+
+    A single line crossing an edge is a genuine spanning heading. Two or more
+    stacked, unspaced OCR fragments may be cut at a character boundary when
+    the OCR engine itself joined adjacent labels.
+    """
+    candidates = []
+    for cell in sorted(cells, key=lambda c: (c["r"], c["c"])):
+        if candidates:
+            prior, originals = candidates[-1]
+            if (cell["text"] and cell.get("header") and prior.get("header")
+                    and cell["cs"] == 1 and originals[-1]["cs"] == 1
+                    and not cell.get("child_tables") and not prior.get("child_tables")
+                    and cell["text"] == prior["text"] and cell["r"] == prior["r"] and cell["rs"] == prior["rs"]
+                    and cell["c"] == prior["c"] + prior["cs"]):
+                # A fragment centred on a ruling can have been copied into
+                # both cells. Reconstruct its span before assigning characters.
+                candidates[-1] = (dict(prior, cs=prior["cs"] + 1,
+                                       bbox=[prior["bbox"][0], prior["bbox"][1], cell["bbox"][2], prior["bbox"][3]]),
+                                  originals + [cell])
+                continue
+        candidates.append((cell, [cell]))
+    result = []
+    for cell, originals in candidates:
+        cols = range(cell["c"], cell["c"] + cell["cs"])
+        if (cell["cs"] <= 1 or not cell.get("header") or cell.get("child_tables")
+                or not cell["text"] or base.is_numeric(cell["text"])):
+            result.extend(originals)
+            continue
+        below = [c for c in cells if c["r"] >= cell["r"] + cell["rs"]
+                 and c["cs"] == 1 and c["c"] in cols and base.is_numeric(c["text"])]
+        rows = {c["r"] for c in below}
+        value_cols = set(cols) - {0}  # A collapsed header can include the row-label column.
+        body_rows = [r for r in rows if {c["c"] for c in below if c["r"] == r} >= value_cols]
+        if not value_cols or not body_rows:
+            result.extend(originals)
+            continue
+        if any(c["cs"] == 1 and c["c"] in value_cols and c["text"] and not base.is_numeric(c["text"])
+               and cell["r"] + cell["rs"] <= c["r"] < min(body_rows) for c in cells):
+            # Specific subheaders already explain the columns: keep the
+            # shared upper heading, even when it wraps into several lines.
+            result.extend(originals)
+            continue
+        cell_pieces = pieces_in(pieces, cell["bbox"])
+        ocr_rows = rows_of(cell_pieces)
+        if len(ocr_rows) > 1 and len(ocr_rows[0]["members"]) == 1:
+            top = ocr_rows[0]["bbox"]
+            width = cell["bbox"][2] - cell["bbox"][0]
+            if top[2] - top[0] < width * .4 and abs(base.center(top)[0] - base.center(cell["bbox"])[0]) < width * .1:
+                # A lone centred upper word can name all the subcolumns.
+                # Assigning it to the middle column would lose that meaning.
+                result.extend(originals)
+                continue
+        groups, crossing, valid = defaultdict(list), 0, True
+        for piece in cell_pieces:
+            b, text = piece["bbox"], piece["text"]
+            col = next((c for c in cols if xs[c] <= base.center(b)[0] < xs[c + 1]), None)
+            if col is None:
+                valid = False
+                break
+            cuts = [x for x in xs[cell["c"] + 1:cell["c"] + cell["cs"]]
+                    if b[0] + 1.5 < x < b[2] - 1.5]
+            if not cuts:
+                groups[col].append(piece)
+                continue
+            crossing += 1
+            if re.search(r"\s|[()%,.:：]", text):
+                valid = False
+                break
+            indices = [(x - b[0]) / (b[2] - b[0]) * len(text) for x in cuts]
+            if any(abs(i - round(i)) > .25 or not 0 < round(i) < len(text) for i in indices):
+                valid = False
+                break
+            ends = [0, *map(round, indices), len(text)]
+            edges = [b[0], *cuts, b[2]]
+            for left, right, start, end in zip(edges, edges[1:], ends, ends[1:]):
+                c = next(c for c in cols if xs[c] <= (left + right) / 2 < xs[c + 1])
+                groups[c].append(dict(piece, text=text[start:end], bbox=[left, b[1], right, b[3]]))
+        if not valid or (crossing and crossing < 2) or set(groups) != set(cols):
+            result.extend(originals)
+            continue
+        if any(len(base.squash("".join(p["text"] for p in group))) < 2 for group in groups.values()):
+            # Widely spaced letters such as "금 액" are one shared word,
+            # not evidence of independent column headings.
+            result.extend(originals)
+            continue
+        for col in cols:
+            lines = rows_of(groups[col])
+            texts = [line["text"] for line in lines]
+            new = dict(cell, c=col, cs=1, bbox=[xs[col], cell["bbox"][1], xs[col+1], cell["bbox"][3]],
+                       text=" ".join(texts), lines=texts, _lines=lines)
+            new.pop("ocr_text", None)
+            result.append(new)
+    return sorted(result, key=lambda c: (c["r"], c["c"]))
+
+
+def split_merged_rows(cells, n_rows, pieces):
+    """Require matching numeric lines in at least two columns before splitting."""
+    result, shifts = [], {}
+    dots = re.compile(r"^[\s.…·ㆍ⋯・]+$")
+    for r in range(n_rows):
+        if any(c["r"] == r and c.get("child_tables") for c in cells):
+            continue
+        if any(c["text"] and c["rs"] > 1 and c["r"] <= r < c["r"] + c["rs"] for c in cells):
+            # Do not expand a spanning subtotal into newly inserted rows.
+            # Ambiguous ruled rows are left to the existing OCR regridding.
+            continue
+        row = [c for c in cells if c["r"] == r and c["rs"] == 1 and not c.get("child_tables")]
+        parts = {id(c): [p for p in pieces_in(pieces, c["bbox"]) if not dots.fullmatch(p["text"])] for c in row}
+        numeric = [parts[id(c)] for c in row if len(parts[id(c)]) >= 2
+                   and all(base.is_numeric(p["text"]) for p in parts[id(c)])]
+        if len(numeric) < 2:
+            continue
+        heights = sorted(p["bbox"][3] - p["bbox"][1] for group in numeric for p in group)
+        tolerance = heights[len(heights)//2] * .4
+        ys = base.cluster([base.center(p["bbox"])[1] for group in numeric for p in group], tolerance=tolerance)
+        if len(ys) < 2 or any(len(group) != len(ys) for group in numeric):
+            continue
+        grouped = {}
+        valid = True
+        for c in row:
+            groups = defaultdict(list)
+            for p in parts[id(c)]:
+                y = base.center(p["bbox"])[1]
+                i = base.nearest(y, ys)
+                if abs(y - ys[i]) > tolerance:
+                    valid = False
+                    break
+                groups[i].append(p)
+            if c["text"] and set(groups) != set(range(len(ys))):
+                valid = False
+            grouped[id(c)] = groups
+        if not valid:
+            continue
+        shifts[r] = len(ys) - 1
+        for c in row:
+            boundaries = [c["bbox"][1], *[(a+b)/2 for a,b in zip(ys, ys[1:])], c["bbox"][3]]
+            for i in range(len(ys)):
+                lines = rows_of(grouped[id(c)][i])
+                texts = [line["text"] for line in lines]
+                result.append(dict(c, r=r, _subrow=i, bbox=[c["bbox"][0], boundaries[i], c["bbox"][2], boundaries[i+1]],
+                                   text=" ".join(texts), lines=texts, _lines=lines))
+    for c in cells:
+        if c["r"] not in shifts or c["rs"] != 1:
+            result.append(dict(c))
+    for c in result:
+        r = c["r"]
+        c["r"] += sum(n for old, n in shifts.items() if old < r) + c.pop("_subrow", 0)
+        c["rs"] += sum(n for old, n in shifts.items() if r <= old < r + c["rs"]) if c["rs"] > 1 else 0
+    return sorted(result, key=lambda c: (c["r"], c["c"])), n_rows + sum(shifts.values())
+
+
+def merge_wrapped_header_dates(cells, n_rows):
+    """Join only a date-range start and its adjacent date continuation."""
+    start = re.compile(r"^\(?\s*\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*[~～〜–-]\s*$")
+    end = re.compile(r"^\s*\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\s*\)?\s*$")
+    removed, joined = set(), {}
+    for r in range(n_rows - 1):
+        upper = [c for c in cells if c["r"] == r and c["rs"] == 1 and c["text"]]
+        lower = [c for c in cells if c["r"] == r + 1 and c["text"]]
+        if (not upper or len(upper) != len(lower)
+                or not all(c["header"] and start.fullmatch(c["text"]) for c in upper)
+                or not all(c["header"] and c["rs"] == 1 and end.fullmatch(c["text"]) for c in lower)):
+            continue
+        pairs = [(c, next((d for d in lower if (d["c"], d["cs"]) == (c["c"], c["cs"])), None)) for c in upper]
+        if any(d is None for _, d in pairs):
+            continue
+        for c, d in pairs:
+            joined[id(c)] = dict(c, text=c["text"] + " " + d["text"], lines=c["lines"] + d["lines"],
+                                 _lines=c["_lines"] + d["_lines"],
+                                 bbox=[min(c["bbox"][0], d["bbox"][0]), c["bbox"][1],
+                                       max(c["bbox"][2], d["bbox"][2]), d["bbox"][3]])
+        removed.add(r + 1)
+    result = []
+    for cell in cells:
+        if cell["r"] in removed:
+            continue
+        c = dict(joined.get(id(cell), cell))
+        c["rs"] -= sum(c["r"] <= r < c["r"] + c["rs"] for r in removed)
+        c["r"] -= sum(r < c["r"] for r in removed)
+        result.append(c)
+    return result, n_rows - len(removed)
+
+
 def regrid_ocr(cells):
     """OCR 상자는 글자 여백까지 포함하므로 PDF보다 좁은 간격으로 행을 나눈다."""
     stacked = [c for c in cells if len(c["_lines"]) >= base.COLLAPSED_MIN_LINES
@@ -521,7 +706,7 @@ def correct_single_cells(cells, pixels, scale):
         for axis, span in (("r", "rs"), ("c", "cs")):
             peers = [c for c in body if c is not cell and c[axis] < cell[axis] + cell[span]
                      and cell[axis] < c[axis] + c[span]]
-            count = sum(base.is_numeric(c["text"]) for c in peers)
+            count = sum(base.is_numeric(c.get("ocr_text", c["text"])) for c in peers)
             if count >= 2 and count * 2 > len(peers):
                 return True
         return False
@@ -656,11 +841,16 @@ def ruled_tables(pixels, scale, pieces, page_number, counter):
         if regridded_rows:
             n_rows = regridded_rows
             table["regridded"] = True
+        cells, n_rows = split_merged_rows(cells, n_rows, pieces)
+        base.mark_headers(cells)
+        cells, n_rows = merge_wrapped_header_dates(cells, n_rows)
         table.update(n_rows=n_rows, n_cols=n_cols, col_edges=[round(x, 1) for x in xs])
         table["header_rule"] = base.mark_headers(cells)
         correct_single_cells(cells, pixels, scale)
+        cells = split_merged_headers(cells, xs, pieces)
         cells, table["n_rows"] = merge_split_row_labels(cells, table["n_rows"])
         table["header_rule"] = base.mark_headers(cells)
+        correct_single_cells(cells, pixels, scale)
         for cell in cells:
             cell.pop("_lines", None)
         base.mark_row_labels(cells)
@@ -810,6 +1000,12 @@ def build(layer1_path, layer1, ocr):
         page_nodes.extend(page_tables)
         page_nodes.sort(key=lambda n: (n["bbox"][1], n["bbox"][0]))
         detect_table_units(page_tables, full_lines)
+        for table in page_tables:
+            above = [line for line in full_lines if 0 <= table["bbox"][1] - line["bbox"][3] < 40]
+            if above:
+                title = max(above, key=lambda line: line["bbox"][3])
+                if "수익률" in title["text"] and re.search(r"기준일\s*[:：]", title["text"]):
+                    table.setdefault("caption", title["text"])
         nodes.extend(page_nodes)
         tables.extend(page_tables)
 

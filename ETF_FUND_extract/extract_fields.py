@@ -9,6 +9,7 @@ CSV flattens list
 indices and includes provenance columns; coverage groups list leaves with ';'.
 """
 import argparse
+import calendar
 import csv
 import datetime as dt
 import json
@@ -98,7 +99,7 @@ def horizon(text):
 
 
 def fee_key(text):
-    s = re.sub(r"[·ㆍ.,()\[\]①-⑳]", "", compact(text))
+    s = re.sub(r"[·ㆍᆞ•∙・.,()\[\]①-⑳]", "", compact(text))
     if "합성" in s or ("피투자" in s and "보수" in s):
         return "synthetic_ter"
     if "동종" in s and "보수" in s:
@@ -115,7 +116,7 @@ def fee_key(text):
         return "other_expenses"
     if "총보수비용" in s:
         return "ter"
-    if "총보수" in s:
+    if "총보수" in s or "보수합계" in s:
         return "total"
     return None
 
@@ -162,6 +163,14 @@ class Document:
             # Grid headers supplement incomplete OCR semantic paths.
             heads = [row[col] for row in g[:min(first_data, r)] if col < len(row)]
             cp = list(dict.fromkeys(cp or heads))
+            # Explicit continuations retain the original column labels AND
+            # period row, even if the new table has no headers of its own.
+            for prior in self.continuation_headers(n):
+                for row in prior.get("grid", []):
+                    if any(number(x) is not None for x in row[1:]):
+                        break
+                    if col < len(row) and row[col] and row[col] not in cp:
+                        cp.append(row[col])
             if not any(cp):
                 previous = self.previous(n, same_columns=True)
                 if previous:
@@ -174,6 +183,14 @@ class Document:
                 rp = list(dict.fromkeys(x for x in g[r][:col] if x and number(x) is None))
             yield c, " ".join(cp), " ".join(rp)
 
+    def continuation_headers(self, n):
+        seen = {n["id"]}
+        prior = self.by_id.get(n.get("continued_from"))
+        while prior and prior["id"] not in seen and prior.get("n_cols") == n.get("n_cols"):
+            seen.add(prior["id"])
+            yield prior
+            prior = self.by_id.get(prior.get("continued_from"))
+
     def previous(self, n, same_columns=False):
         for prior in reversed(self.tables[:self.tables.index(n)]):
             if n.get("page", 0) - prior.get("page", 0) > 1:
@@ -184,7 +201,7 @@ class Document:
         return None
 
     def header_raw(self, n, c, fallback):
-        for table in (n, self.previous(n, same_columns=True)):
+        for table in (n, *self.continuation_headers(n), self.previous(n, same_columns=True)):
             if table:
                 matches = [h for h in table.get("cells", [])
                            if h["c"] <= c["c"] < h["c"] + h.get("cs", 1)
@@ -193,6 +210,21 @@ class Document:
                 if matches:
                     return table, matches[-1]["text"]
         return n, fallback
+
+    def returns_date(self, n):
+        """Only an explicit date in the caption or immediate title is usable."""
+        sources = [(n, n.get("caption") or "")]
+        above = [(p, t) for p, t in self.texts if p.get("type") != "table"
+                 and p.get("page") == n.get("page") and p.get("bbox") and n.get("bbox")
+                 and 0 <= n["bbox"][1] - p["bbox"][3] < 40]
+        if above:
+            sources.append(max(above, key=lambda item: item[0]["bbox"][3]))
+        for node, raw in sources:
+            m = re.search(r"(?<![가-힣])기준일\s*[:：]\s*(.*)", raw)
+            ds = dates(m[1]) if m else []
+            if ds:
+                return evidence(ds[0], node, raw)
+        return None
 
     def unit(self, n, money=False):
         seen = set()
@@ -254,6 +286,9 @@ def performance(doc, out):
         if not any(horizon(cp) for _, cp, _ in es):
             continue
         ds = dates(" ".join(cp for _, cp, _ in es))
+        title_date = doc.returns_date(n)
+        if not ds and title_date:
+            ds = [value(title_date)]
         candidates.append((max(ds, default=""), -n.get("page", 0), n, es))
     # Date headers can occur in an undated summary even when the detailed
     # performance table is newer. Inception is independent of that selection.
@@ -286,23 +321,41 @@ def performance(doc, out):
                 if ds and out[kind]["as_of_date"] is None:
                     hn, raw = doc.header_raw(n, c, cp)
                     out[kind]["as_of_date"] = evidence(max(ds), hn, raw)
+                elif out[kind]["as_of_date"] is None:
+                    out[kind]["as_of_date"] = doc.returns_date(n)
 
     annual = {}
     for n in doc.tables:
         ctx = doc.context(n)
-        text = compact(" ".join(c.get("text", "") for c in n.get("cells", [])))
-        if not ("연도별수익률" in ctx or ("년차" in text and "비교지수" in text)):
+        text = compact(" ".join(c.get("text", "") for t in (n, *doc.continuation_headers(n))
+                                for c in t.get("cells", [])))
+        if not ("연도별수익률" in ctx or ("년차" in text and any(x in text for x in ("비교지수", "기초지수")))):
             continue
+        title_date = doc.returns_date(n)
         for c, cp, rp in doc.entries(n):
             if len(set(re.findall(r"최근\s*\d년차", cp))) > 1:
                 continue  # A merged header no longer identifies a unique year.
             ds = dates(cp)
             ym = re.search(r"(?:19|20)\d{2}(?=년|\b)", cp)
+            inferred = False
+            nth = re.search(r"최근\s*(\d+)\s*년차", cp)
+            if not ds and not ym and nth and title_date:
+                as_of = dt.date.fromisoformat(value(title_date))
+                def years_before(n):
+                    year = as_of.year - n
+                    return as_of.replace(year=year, day=min(as_of.day, calendar.monthrange(year, as_of.month)[1]))
+                count = int(nth[1])
+                if count < 1:
+                    continue
+                ds = [(years_before(count) + dt.timedelta(days=1)).isoformat(), years_before(count - 1).isoformat()]
+                inferred = True
             year = max(ds)[:4] if ds else ym[0] if ym else None
             kind = row_kind(rp)
             if not year or kind not in ("returns", "benchmark_returns"):
                 continue
             hn, raw = doc.header_raw(n, c, cp)
+            if inferred:
+                hn, raw = n, cp + " | " + title_date["raw"]
             item = annual.setdefault(year, {"year": evidence(int(year), hn, raw),
                                            "fund": None, "benchmark": None, "period": None})
             key = "fund" if kind == "returns" else "benchmark"
@@ -314,9 +367,15 @@ def performance(doc, out):
 
 def costs(doc, out):
     candidates = []
+    selected = {}
     for n in doc.tables:
         txt = compact(" ".join(c.get("text", "") for c in n.get("cells", [])))
-        trading_rate = any(s in txt for s in ("매매·중개수수료율", "매매중개수수료율", "매매ㆍ중개수수료율"))
+        if n.get("continued_from") in selected:
+            detailed = selected[n["continued_from"]]
+            candidates.append((detailed, n))
+            selected[n["id"]] = detailed
+            continue
+        trading_rate = "매매중개수수료율" in re.sub(r"[·ㆍᆞ•∙・]", "", txt)
         if "보수" not in txt and not trading_rate:
             continue
         if not (trading_rate or "보수및" in doc.context(n) or "지급비율" in txt or
@@ -324,6 +383,7 @@ def costs(doc, out):
             continue
         detailed = any(s in txt for s in ("집합투자업자보수", "일반사무관리", "신탁업자보수"))
         candidates.append((int(detailed), n))
+        selected[n["id"]] = int(detailed)
     for _, n in sorted(candidates, key=lambda x: x[0], reverse=True):
         for c, cp, rp in doc.entries(n):
             if re.search(r"\d+년", compact(cp)) or any(x in compact(cp + rp) for x in ("투자기간별", "예시", "지급시기", "년후")):
@@ -345,9 +405,9 @@ def costs(doc, out):
             key = next((fee_key(p) for p in reversed(paths) if fee_key(p)), None) or fee_key(rp)
             if key and out["fees"][key] is None:
                 out["fees"][key] = evidence(float(number(c["text"])), n, c["text"])
-            labels = compact(cp + rp)
+            labels = re.sub(r"[·ㆍᆞ•∙・]", "", compact(cp + rp))
             if out["trading_cost"] is None and any(s in labels for s in
-                    ("매매중개", "매매·중개", "매매ㆍ중개", "증권거래비용", "매매수수료")):
+                    ("매매중개", "증권거래비용", "매매수수료")):
                 out["trading_cost"] = evidence(float(number(c["text"])), n, c["text"])
 
 
@@ -434,6 +494,75 @@ def history(doc, out):
     out["asset_history"] = [rows[p] for p in sorted(rows, key=lambda s: s.split("/")[-1], reverse=True)] or None
 
 
+FUND_TYPE_LABEL = r"(?:주식혼합|채권혼합|재간접|주식|채권|혼합)(?:형)?"
+
+
+def fund_type_evidence(doc, fund_name):
+    """Prefer classification rows; accept only known asset-type labels."""
+    pattern = r"증권(?:형)?[\[(](" + FUND_TYPE_LABEL + r")[\])]"
+    for n in doc.tables:
+        for row in n.get("grid", []):
+            if any(compact(cell).strip(":：") == "분류" for cell in row):
+                for raw in row:
+                    m = re.search(pattern, compact(raw))
+                    if m:
+                        label = m[1] if m[1].endswith("형") else m[1] + "형"
+                        return evidence("증권(" + label + ")", n, raw)
+    for n, raw in doc.texts:
+        m = re.search(pattern, compact(raw))
+        if m:
+            label = m[1] if m[1].endswith("형") else m[1] + "형"
+            return evidence("증권(" + label + ")", n, raw)
+    if fund_name:
+        m = re.search(r"[\[(](" + FUND_TYPE_LABEL + r")[\])]$", compact(value(fund_name)))
+        if m:
+            label = m[1] if m[1].endswith("형") else m[1] + "형"
+            return {**fund_name, "value": "증권(" + label + ")"}
+    return None
+
+
+def benchmark_name(raw):
+    """Cut separators/weights only outside balanced index qualifiers."""
+    depth = 0
+    end = len(raw)
+    for i, char in enumerate(raw):
+        if depth == 0 and (char in ",;\n" or
+                           re.match(r"\s*[×x*]\s*\d+%|\s+\d+%", raw[i:])):
+            end = i
+            break
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+    if depth:
+        return None
+    return re.sub(r"(?:100(?:\.0+)?|\d{1,2}(?:\.\d+)?)%$", "", raw[:end].strip()).strip()
+
+
+def inception_period(tail):
+    """A period starting at inception does not disclose the inception date."""
+    return bool(re.match(r"[:：]?(?:[~～〜∼–—-]|부터|까지|로부터|이후|이전)", compact(tail)))
+
+
+def history_inception(doc):
+    for n, raw in doc.texts:
+        s = compact(raw)
+        # OCR may flatten a dated history row into a paragraph.
+        m = re.fullmatch(r"(.+?)최초설정(?:일)?[.]?", s)
+        if m and len(dates(m[1])) == 1:
+            return evidence(dates(m[1])[0], n, raw)
+    for n in doc.tables:
+        for row in n.get("grid", []):
+            if any(compact(cell) == "최초설정" for cell in row):
+                raw = " ".join(dict.fromkeys(row))
+                found = dates(raw)
+                if len(found) == 1:
+                    return evidence(found[0], n, raw)
+    return None
+
+
 def identity_classification(doc, out):
     ident, cls, ds = out["identity"], out["classification"], out["dates"]
     for k in ("fund_name", "fund_code"):
@@ -473,17 +602,15 @@ def identity_classification(doc, out):
                 ident["manager"] = evidence(m[1], n, raw)
             elif re.fullmatch(company, s):
                 ident["manager"] = evidence(s, n, raw)
-        if not cls["fund_type"]:
-            m = re.search(r"증권[\[(]((?:주식|채권|혼합)[가-힣]*)(?:형)?[\])]", s)
-            if m:
-                t = m[1] if m[1].endswith("형") else m[1] + "형"
-                cls["fund_type"] = evidence("증권(" + t + ")", n, raw)
         for key, pattern in (("inception_date", r"최초설정일|최초설정|설정일자"),
                              ("listing_date", r"상장일(?:자)?[:：]?")):
             if ds[key] is None:
                 m = re.search(pattern, s)
                 if m:
-                    found = dates(s[m.end():m.end()+25])
+                    tail = s[m.end():]
+                    if key == "inception_date" and inception_period(tail):
+                        continue
+                    found = dates(tail[:25])
                     if found:
                         ds[key] = evidence(found[0], n, raw)
         if cls["currency_hedge"] is None and "환헤지" in s:
@@ -499,13 +626,16 @@ def identity_classification(doc, out):
                     break
         if cls["benchmark_index"] is None:
             # Explicit labelled index names; stop before strategy prose.
-            m = re.search(r"(?:기초\s*지수|추적\s*대상\s*지수|비교\s*지수)\s*[:：]\s*([A-Za-z가-힣0-9][A-Za-z가-힣0-9&+()./_ -]{1,65})", raw.replace("\n", " "))
+            m = re.search(r"(?:기초\s*지수|추적\s*대상\s*지수|비교\s*지수)(?:\s*\([^)]*지수\))?\s*[:：]\s*([A-Za-z가-힣0-9][A-Za-z가-힣0-9&+().,/_% -]{1,65})", raw.replace("\n", " "))
             if not m:
                 m = re.search(r"([A-Za-z][A-Za-z0-9 ]{1,35}(?:지수|Index))[^.]{0,8}(?:를|을)(?:기초지수|추적대상지수|비교지수)", s)
+            if not m:
+                m = re.search(r'''["“‘']([^"”’']{2,65})["”’'](?:의)?수익률(?:을|를)추적''', s)
             if m:
-                name = re.split(r"\s*[×x]\s*\d+%|\s+\d+%|[;\n]", m[1])[0].strip()
-                if len(name) <= 65 and not re.search(r"합니다|투자신탁|없음|사용하고|수익률|변경|선정|하여", name):
+                name = benchmark_name(m[1])
+                if name and len(name) <= 65 and not re.search(r"합니다|투자신탁|없음|사용하고|수익률|변경|선정|하여", name):
                     cls["benchmark_index"] = evidence(name, n, raw)
+    cls["fund_type"] = fund_type_evidence(doc, ident["fund_name"])
     # A labelled 100% index target establishes 1x; absence of leverage wording
     # alone does not establish a multiplier.
     fund_name = value(ident["fund_name"]) or ""
@@ -513,18 +643,22 @@ def identity_classification(doc, out):
         mult = -2 if "인버스" in fund_name and re.search(r"2X|2배|레버리지", fund_name, re.I) else -1 if "인버스" in fund_name else 2
         cls["leverage"] = {**ident["fund_name"], "value": mult}
     else:
+        implied = None
         for n, raw in doc.texts:
             s = compact(raw)
             m = re.search(r"(?:추적대상지수|기초지수|비교지수).{0,50}?(?:[x×*]|배율[:：]?)(-?[12])(?:[.]0)?배?", s, re.I)
             if m and ("투자목적" in doc.context(n) or "추적대상지수:" in s):
                 cls["leverage"] = evidence(int(m[1]), n, raw)
                 break
-            if re.search(r"(?:추적대상지수|기초지수|비교지수)[:：].{1,50}100%", s):
-                cls["leverage"] = evidence(1, n, raw)
+            multiple = re.search(r"(?:지수|변동률).{0,50}?(-?[12])(?:[.]0)?배(?:수)?(?:와|를|의|수준)", s)
+            if multiple and any(x in s for x in ("유사", "추종", "추적", "투자목적")):
+                cls["leverage"] = evidence(int(multiple[1]), n, raw)
                 break
-            if re.search(r"추적대상지수의변동률과(?:동일|유사)", s):
-                cls["leverage"] = evidence(1, n, raw)
-                break
+            if (re.search(r"(?:추적대상지수|기초지수|비교지수)(?:\([^)]*지수\))?[:：].{1,50}100%", s)
+                    or re.search(r"(?:추적대상지수|기초지수)(?:인.{1,40}?지수)?의변동률과(?:동일|유사)", s)):
+                implied = implied or evidence(1, n, raw)
+        if cls["leverage"] is None:
+            cls["leverage"] = implied
 
 
 def extract(data):
@@ -538,6 +672,8 @@ def extract(data):
            "dates": dict.fromkeys(("inception_date", "listing_date", "as_of_date"))}
     identity_classification(doc, out)
     performance(doc, out)
+    if out["dates"]["inception_date"] is None:
+        out["dates"]["inception_date"] = history_inception(doc)
     costs(doc, out)
     financials(doc, out)
     # 규모 축에 필요한 순자산만 남긴다. 금액은 원 단위로 합쳐 값 하나로 저장한다.

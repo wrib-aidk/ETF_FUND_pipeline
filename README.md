@@ -69,7 +69,7 @@ OCR 서버 접속 정보는 환경 변수로 넣습니다. 코드에는 들어 �
 | `OCR_API_KEY` | `X-API-Key` 헤더 값 |
 | `OCR_BASIC_AUTH` | 터널 앞단 Basic 인증 `사용자:비밀번호` (없으면 생략) |
 
-Windows에서는 현재 셸에 없는 값을 사용자 환경 변수(`HKCU\Environment`)에서도 읽습니다.
+저장소 루트의 `.env` 파일(`이름=값` 한 줄씩, git 제외)에 적어 두어도 됩니다. 읽는 순서는 현재 셸 환경 변수, `.env`, Windows 사용자 환경 변수(`HKCU\Environment`)입니다.
 
 ### 실행
 
