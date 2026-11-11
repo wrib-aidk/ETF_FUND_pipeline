@@ -121,6 +121,63 @@ def fee_key(text):
     return None
 
 
+# 아래 보조 규칙은 기존 규칙이 끝난 뒤 빈 칸에만 쓴다 (일반 펀드 투자설명서 대응).
+FEE_ROLES = (("management", r"집합투자업자|집합투자"), ("ap", r"판매회사|지정참가"),
+             ("trustee", r"신탁업자|수탁회사"), ("admin", r"일반사무|사무관리"))
+
+
+def fee_key_loose(text):
+    """Header words without '보수' or with common OCR typos (판매 회사, 신탈 보수, 사문 보수)."""
+    s = re.sub(r"[·ㆍᆞ•∙・.,()\[\]①-⑳]", "", compact(text))
+    if fee_key(s) or "수수료" in s:
+        return None
+    if re.fullmatch(r"(?:집합투자업자|운용)(?:보수)?", s):
+        return "management"
+    if re.fullmatch(r"판매(?:회사)?(?:보수)?", s) and s != "판매":
+        return "ap"
+    if re.fullmatch(r"(?:신탁업자|신탁|신탈|수탁)(?:보수)?", s) and s not in ("신탁", "수탁"):
+        return "trustee"
+    if re.fullmatch(r"(?:일반)?(?:사무관리|사문|사무)(?:회사)?(?:보수)?", s) and s not in ("사무", "일반사무"):
+        return "admin"
+    return None
+
+
+def fee_roles(text):
+    """Fee roles named in one header cell, in reading order."""
+    s = compact(text)
+    found = sorted((m.start(), key) for key, pattern in FEE_ROLES for m in [re.search(pattern, s)] if m)
+    return list(dict.fromkeys(key for _, key in found))
+
+
+CLASS_CODE = r"[A-Za-z][A-Za-z0-9]{0,3}(?:\s*-\s*[A-Za-z0-9]{1,4}){0,2}"
+
+
+def norm_class(code):
+    return re.sub(r"[\s\-]", "", code or "").upper() or None
+
+
+def class_code(label):
+    """Share-class code in a row label (예: '수수료미징구-온라인슈퍼(S-P)', 'S-P 수수료…', '종류A …').
+
+    여러 클래스가 한 칸에 합쳐져 있으면 '?', 클래스 행이 아니면 None.
+    """
+    s = (label or "").strip()
+    s = re.sub(r"^투자비용\s*", "", s)
+    codes = []
+    if "수수료" in s:
+        codes = [m[1] for m in re.finditer(r"\(\s*(" + CLASS_CODE + r")\s*[()]", s)]
+        # 표 제목 형식: '…[채권]_S-P(수수료미징구-온라인슈퍼-개인연금)'
+        codes += [m[1] for m in re.finditer(r"_\s*(" + CLASS_CODE + r")\s*\(", s)]
+    if not codes:
+        m = re.match(r"(?:종류|클래스|class)?\s*(" + CLASS_CODE + r")(?:형|클래스)?(?=\s|$|\(\s*수수료)", s, re.I)
+        if m and (len(s) <= 6 or "수수료" in s or re.match(r"종류|클래스|class", s, re.I)):
+            codes = [m[1]]
+    codes = list(dict.fromkeys(re.sub(r"\s+", "", c) for c in codes))
+    if not codes:
+        return None
+    return codes[0] if len({norm_class(c) for c in codes}) == 1 else "?"
+
+
 class Document:
     def __init__(self, data):
         self.data = data
@@ -269,7 +326,36 @@ def row_kind(label):
     return None
 
 
-def performance(doc, out):
+def table_class(doc, n):
+    """Class named in the title right above a table (클래스별로 성과표를 따로 싣는 문서)."""
+    above = [(p, t) for p, t in doc.texts if p.get("type") != "table" and p.get("page") == n.get("page")
+             and p.get("bbox") and n.get("bbox") and 0 <= n["bbox"][1] - p["bbox"][3] < 60]
+    if not above:
+        return None
+    code = class_code(max(above, key=lambda item: item[0]["bbox"][3])[1])
+    return None if code == "?" else code
+
+
+def class_kind(kind, rp, target, has_target, table_code=None):
+    """Apply share-class rules after row_kind; ETF rows (no class code) are unchanged.
+
+    - 받은 클래스가 있으면 다른 클래스의 펀드 행은 버리고, 표에 그 클래스 행이 있으면
+      클래스 표시가 없는 펀드 행도 버린다 (비교지수·변동성 행은 그대로).
+    - row_kind가 못 알아본 클래스 행(예: 'C(수수료미징구-오프라인)')은 펀드 행으로 본다.
+    """
+    code = class_code(rp) or (table_code if kind == "returns" else None)
+    if kind not in (None, "returns"):
+        return kind
+    if code:
+        if code == "?" or (target and norm_class(code) != target):
+            return None
+        return "returns"
+    if kind == "returns" and target:
+        return None  # 클래스 표시가 없는 펀드 행은 받은 클래스 값인지 알 수 없다.
+    return kind
+
+
+def performance(doc, out, target=None):
     candidates = []
     for n in doc.tables:
         text = compact(" ".join(c.get("text", "") for c in n.get("cells", [])))
@@ -280,6 +366,10 @@ def performance(doc, out):
             continue
         if "운용전문" in ctx or "생년" in text:
             continue
+        if target and not any(x in text for x in ("비교지수", "수익률변동성", "투자신탁")):
+            # 클래스 행이 많으면 비교지수·투자신탁 행은 다음 쪽 이어진 표로 밀려난다.
+            text += compact(" ".join(c.get("text", "") for t in doc.tables if t.get("continued_from") == n["id"]
+                                     for c in t.get("cells", [])))
         if not any(x in text for x in ("비교지수", "수익률변동성", "투자신탁")):
             continue
         es = list(doc.entries(n))
@@ -290,6 +380,16 @@ def performance(doc, out):
         if not ds and title_date:
             ds = [value(title_date)]
         candidates.append((max(ds, default=""), -n.get("page", 0), n, es))
+    if target:
+        # 받은 클래스 행은 다음 쪽으로 이어진 표에 있는 경우가 많다. 앞 표와 같은 날짜로 본다.
+        picked = {x[2]["id"]: x for x in candidates}
+        for n in doc.tables:
+            prior = picked.get(n.get("continued_from"))
+            if prior and n["id"] not in picked:
+                es = list(doc.entries(n))
+                if any(horizon(cp) for _, cp, _ in es):
+                    picked[n["id"]] = (prior[0], -n.get("page", 0), n, es)
+                    candidates.append(picked[n["id"]])
     # Date headers can occur in an undated summary even when the detailed
     # performance table is newer. Inception is independent of that selection.
     for n in doc.tables:
@@ -308,6 +408,9 @@ def performance(doc, out):
         # A single merged row label can cover both fund and benchmark rows.
         fund_rows = sorted({c["r"] for c, cp, rp in es if horizon(cp)
                             and "투자신탁" in compact(rp)})
+        tcode = table_class(doc, n) if target else None
+        has_target = bool(target) and (norm_class(tcode) == target or
+                                       any(norm_class(class_code(rp)) == target for _, _, rp in es))
         for c, cp, rp in es:
             h = horizon(cp)
             if not h:
@@ -315,6 +418,7 @@ def performance(doc, out):
             kind = row_kind(rp)
             if "비교지수" in compact(rp) and "투자신탁" in compact(rp) and len(fund_rows) >= 2:
                 kind = "returns" if c["r"] == fund_rows[0] else "benchmark_returns"
+            kind = class_kind(kind, rp, target, has_target, tcode)
             if kind and out[kind][h] is None:
                 out[kind][h] = evidence(float(number(c["text"])), n, c["text"])
                 ds = dates(cp)
@@ -332,7 +436,11 @@ def performance(doc, out):
         if not ("연도별수익률" in ctx or ("년차" in text and any(x in text for x in ("비교지수", "기초지수")))):
             continue
         title_date = doc.returns_date(n)
-        for c, cp, rp in doc.entries(n):
+        entries = list(doc.entries(n))
+        tcode = table_class(doc, n) if target else None
+        has_target = bool(target) and (norm_class(tcode) == target or
+                                       any(norm_class(class_code(rp)) == target for _, _, rp in entries))
+        for c, cp, rp in entries:
             if len(set(re.findall(r"최근\s*\d년차", cp))) > 1:
                 continue  # A merged header no longer identifies a unique year.
             ds = dates(cp)
@@ -351,6 +459,8 @@ def performance(doc, out):
                 inferred = True
             year = max(ds)[:4] if ds else ym[0] if ym else None
             kind = row_kind(rp)
+            fallback = kind is None
+            kind = class_kind(kind, rp, target, has_target, tcode)
             if not year or kind not in ("returns", "benchmark_returns"):
                 continue
             hn, raw = doc.header_raw(n, c, cp)
@@ -359,13 +469,114 @@ def performance(doc, out):
             item = annual.setdefault(year, {"year": evidence(int(year), hn, raw),
                                            "fund": None, "benchmark": None, "period": None})
             key = "fund" if kind == "returns" else "benchmark"
+            if fallback and item[key] is not None:
+                continue  # 클래스 행 보완은 빈 칸만 채운다.
             item[key] = evidence(float(number(c["text"])), n, c["text"])
             if ds:
                 item["period"] = evidence("/".join([min(ds), max(ds)]), hn, raw)
     out["annual_returns"] = [annual[y] for y in sorted(annual, reverse=True)] or None
 
 
-def costs(doc, out):
+def row_class(doc, n, r, rp):
+    """class_code, plus a label split at a page break: '수수료후취-온라인슈퍼' | 다음 쪽 '(S)'."""
+    code = class_code(rp)
+    if code or "수수료" not in rp or r != len(n.get("grid", [])) - 1:
+        return code
+    for nxt in doc.tables:
+        if nxt.get("continued_from") == n["id"] and nxt.get("grid"):
+            first = [x for x in nxt["grid"][0] if x]
+            m = re.fullmatch(r"\(\s*(" + CLASS_CODE + r")\s*\)", first[0].strip()) if len(first) == 1 else None
+            return re.sub(r"\s+", "", m[1]) if m else None
+    return None
+
+
+def header_cells(n, c):
+    return [h for h in n.get("cells", []) if h["r"] < c["r"] and h["c"] <= c["c"] < h["c"] + h.get("cs", 1)]
+
+
+def inherited_headers(doc, n, c):
+    """(table, header cell) pairs over column c; 머리글 없는 이어진 표는 앞 표의 머리글을 쓴다."""
+    data_rows = {r for r, row in enumerate(n.get("grid", [])) if sum(number(x) is not None for x in row[1:]) >= 2}
+    own = [h for h in header_cells(n, c) if h["r"] not in data_rows and h.get("text")]
+    if own:
+        return [(n, h) for h in own]
+    for prior in doc.continuation_headers(n):
+        prior_data = {r for r, row in enumerate(prior.get("grid", [])) if sum(number(x) is not None for x in row[1:]) >= 2}
+        heads = [(prior, h) for h in prior.get("cells", []) if h["r"] not in prior_data and h.get("text")
+                 and number(h["text"]) is None and h["c"] <= c["c"] < h["c"] + h.get("cs", 1) and h["c"] > 0]
+        if heads:
+            return heads
+    return []
+
+
+def merged_role(n, c, h):
+    """Role of column c under a header naming several roles (예: '판매회사 신탁업자 보수').
+
+    같은 글자의 머리글 칸이 역할 수만큼 나란히 있으면 순서대로 나눈다. 아니면 None.
+    """
+    roles = fee_roles(h.get("text"))
+    cols = sorted({col for x in n.get("cells", []) if x["r"] == h["r"] and x.get("text") == h.get("text")
+                   for col in range(x["c"], x["c"] + x.get("cs", 1))})
+    if len(roles) >= 2 and len(cols) == len(roles) and cols == list(range(cols[0], cols[0] + len(cols))):
+        return roles[cols.index(c["c"])]
+    return None
+
+
+PERIOD = re.compile(r"(최초설정일|\d{4}년\d{1,2}월\d{1,2}일)(?:로)?부터(\d{4}년\d{1,2}월\d{1,2}일)?")
+
+
+def period_of(text):
+    """'[2032년1월1일부터2036년12월31일까지]' → ('2032-01-01', '2036-12-31'). 시작이 최초설정일이면 None, 끝이 없으면 None."""
+    found = list(PERIOD.finditer(compact(text or "")))
+    if not found:
+        return None
+    m = found[-1]
+    as_iso = lambda s: s and "{}-{:02d}-{:02d}".format(*map(int, re.findall(r"\d+", s)))
+    return (None if m[1] == "최초설정일" else as_iso(m[1]), as_iso(m[2]))
+
+
+def off_period_tables(doc, as_of):
+    """기준일이 들지 않는 기간의 보수표 id. 기준일이 든 기간 표가 하나라도 있어야 쓴다 (없으면 빈 집합).
+
+    기간 제목이 없는 표는 이어진 표이거나, 바로 앞 표와 같은 제목 아래(제목이 앞 표 제목의 앞부분)이면 앞 표의 기간을 잇는다.
+    """
+    if not as_of or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(as_of)):
+        return set()
+    periods, last, last_ctx = {}, None, ""
+    for n in doc.tables:
+        ctx = doc.context(n)
+        p = period_of(ctx)
+        if p is None and n.get("continued_from") in periods:
+            p = periods[n["continued_from"]]
+        elif p is None and last and len(ctx) > 10 and last_ctx.startswith(ctx):
+            p = last
+        if p is not None:
+            periods[n["id"]] = p
+        last, last_ctx = p, ctx
+    inside = {i for i, (s, e) in periods.items() if (s or "") <= as_of and (e is None or as_of <= e)}
+    return set(periods) - inside if inside else set()
+
+
+BARE_ROLES = {"집합투자": "management", "운용": "management", "판매": "ap", "수탁": "trustee", "신탁": "trustee"}
+
+
+def bare_role(n, h):
+    """'집합투자 | 판매 | 수탁'처럼 역할 이름만 쓴 머리글. 같은 머리글 줄에 역할이 3개 이상일 때만 읽는다."""
+    text = re.sub(r"[·ㆍᆞ•∙・.,()\[\]①-⑳]", "", compact(h.get("text")))
+    if text not in BARE_ROLES:
+        return None
+    row = {compact(x.get("text")) for x in n.get("cells", []) if x["r"] == h["r"] and x.get("header")}
+    roles = {BARE_ROLES.get(t) or fee_key_loose(t) or fee_key(t) for t in row} & {"management", "ap", "trustee", "admin"}
+    return BARE_ROLES[text] if len(roles) >= 3 else None
+
+
+def class_qualified(label, target):
+    """받은 클래스 코드 바로 뒤에 한글 괄호 구분이 붙었는지 (예: 'S-P (퇴직)', '(S-P(퇴직))')."""
+    return any(norm_class(m[1]) == target for m in re.finditer(
+        r"(?<![A-Za-z])(" + CLASS_CODE + r")\s*\(\s*(?!수수료)[가-힣]", label or ""))
+
+
+def costs(doc, out, target=None):
     candidates = []
     selected = {}
     for n in doc.tables:
@@ -384,31 +595,123 @@ def costs(doc, out):
         detailed = any(s in txt for s in ("집합투자업자보수", "일반사무관리", "신탁업자보수"))
         candidates.append((int(detailed), n))
         selected[n["id"]] = int(detailed)
-    for _, n in sorted(candidates, key=lambda x: x[0], reverse=True):
+    ordered = [n for _, n in sorted(candidates, key=lambda x: x[0], reverse=True)]
+    fee_rows = {}
+    off_period = off_period_tables(doc, value(out["dates"].get("as_of_date")))
+    plain_rows = {}
+
+    def qualified_sibling(n, r, rp):
+        """'S-P(퇴직)'처럼 받은 클래스 뒤에 한글 구분이 붙은 행. 같은 표에 구분 없는 행이 있을 때만 True."""
+        if not target or not class_qualified(rp, target):
+            return False
+        if n["id"] not in plain_rows:
+            plain_rows[n["id"]] = any(
+                norm_class(row_class(doc, n, rr, label)) == target and not class_qualified(label, target)
+                for rr, label in {(c["r"], rp2) for c, _, rp2 in doc.entries(n)})
+        return plain_rows[n["id"]]
+
+    def usable(n, c, cp, rp):
+        if re.search(r"\d+년", compact(cp)) or any(x in compact(cp + rp) for x in ("투자기간별", "예시", "지급시기", "년후")):
+            return False
+        # 기간별 보수표(TDF 등)는 기준일이 든 기간의 표만 쓴다. 기간 표가 없는 문서는 그대로.
+        if n["id"] in off_period or qualified_sibling(n, c["r"], rp):
+            return False
+        # 받은 클래스가 주어지면 그 클래스로 확인되는 행만 쓴다. 클래스 표시가 없는 행은
+        # 어느 클래스 값인지 알 수 없어 쓰지 않는다 (meta가 없으면 기존 규칙 그대로).
+        if not target or norm_class(row_class(doc, n, c["r"], rp)) == target:
+            return True
+        # 뒤집힌 표: 클래스가 열 머리글에 있고 행은 보수 이름(집합투자업자보수 …)이다.
+        if (class_code(rp) is None and fee_key(rp)
+                and any(norm_class(class_code(p)) == target for p in (c.get("col_path") or []))):
+            return True
+        # 모든 클래스에 같은 값이라 세로로 합쳐진 칸은 덮는 행 중에 받은 클래스가 있으면 쓴다.
+        g = n.get("grid", [])
+        rows = range(c["r"] + 1, min(c["r"] + c.get("rs", 1), len(g)))
+        return any(norm_class(class_code(" ".join(x for x in g[r][:c["c"]] if x and number(x) is None))) == target
+                   for r in rows)
+
+    def inherited_key(n, c, strict):
+        """Key from the nearest header over c (이어진 표는 앞 표의 머리글). 합쳐진 머리글은 칸 위치로 나눈다."""
+        heads = sorted(inherited_headers(doc, n, c), key=lambda th: th[1]["r"])
+        if not heads:
+            return None
+        ht, h = heads[-1]
+        if (n["id"], c["r"], c["c"]) in merged:
+            return merged_role(ht, c, h)
+        key = ((strict and fee_key(h.get("text", ""))) or fee_key_loose(h.get("text", ""))
+               or (bare_role(ht, h) if target else None))
+        if key is None and target:
+            # 머리글 끝줄('보수')만 다음 쪽 표로 넘어간 경우: 바로 위 머리글(앞 쪽 표 포함)과 이어 읽는다.
+            above = [hh for _, hh in heads[:-1]]
+            prior = doc.by_id.get(n.get("continued_from"))
+            if not above and prior and ht is n:
+                # 앞 표의 마지막 줄 머리글은 아래가 다음 쪽이라 머리글 표시가 빠질 수 있다.
+                above = [x for x in prior.get("cells", []) if x.get("text")
+                         and number(x["text"]) is None and sum(number(v) is not None for v in prior["grid"][x["r"]][1:]) < 2 and x["c"] <= c["c"] < x["c"] + x.get("cs", 1)]
+                above.sort(key=lambda x: x["r"])
+            if above:
+                key = fee_key(compact(above[-1].get("text", "")) + compact(h.get("text", "")))
+        return key
+
+    def put(key, n, c, rp):
+        out["fees"][key] = evidence(float(number(c["text"])), n, c["text"])
+        fee_rows[key] = (n, rp)
+
+    merged, blocked = set(), set()
+
+    def classify(n, c):
+        for _, h in inherited_headers(doc, n, c):
+            text = compact(h.get("text"))
+            roles = sum(word in text for word in ("집합투자", "지정참가", "신탁", "사무관리"))
+            if ((roles > 1 and "보수" in text)
+                    or ("동종" in text and "지정참가" in text and "판매수수료" in text)
+                    or ("동종" in text and ("합성" in text or "피투자" in text))
+                    or ("피투자" in text and "거래" in text)):
+                blocked.add((n["id"], c["r"], c["c"]))
+            elif len(fee_roles(text)) > 1:
+                # OCR이 이웃 머리글을 합친 칸: 한 역할로 읽으면 다른 보수가 들어간다.
+                merged.add((n["id"], c["r"], c["c"]))
+        if any(len(fee_roles(p)) > 1 and "지정참가" not in compact(p) for p in (c.get("col_path") or [])[-1:]):
+            merged.add((n["id"], c["r"], c["c"]))
+
+    for n in ordered:
         for c, cp, rp in doc.entries(n):
-            if re.search(r"\d+년", compact(cp)) or any(x in compact(cp + rp) for x in ("투자기간별", "예시", "지급시기", "년후")):
+            if not usable(n, c, cp, rp):
                 continue
-            ambiguous = False
-            for h in n.get("cells", []):
-                if h["r"] < c["r"] and h["c"] <= c["c"] < h["c"] + h.get("cs", 1):
-                    text = compact(h.get("text"))
-                    roles = sum(word in text for word in ("집합투자", "지정참가", "신탁", "사무관리"))
-                    if ((roles > 1 and "보수" in text)
-                            or ("동종" in text and "지정참가" in text and "판매수수료" in text)
-                            or ("동종" in text and ("합성" in text or "피투자" in text))
-                            or ("피투자" in text and "거래" in text)):
-                        ambiguous = True
-            if ambiguous:
+            classify(n, c)
+            if (n["id"], c["r"], c["c"]) in blocked | merged:
                 continue
-            paths = c.get("col_path") or [h.get("text", "") for h in n.get("cells", [])
-                     if h["r"] < c["r"] and h["c"] <= c["c"] < h["c"] + h.get("cs", 1)]
+            paths = c.get("col_path") or [h.get("text", "") for h in header_cells(n, c)]
             key = next((fee_key(p) for p in reversed(paths) if fee_key(p)), None) or fee_key(rp)
+            if key is None and target:
+                # 받은 클래스 행은 머리글 없는 이어진 표에 있는 경우가 많다.
+                key = inherited_key(n, c, strict=True)
             if key and out["fees"][key] is None:
-                out["fees"][key] = evidence(float(number(c["text"])), n, c["text"])
+                put(key, n, c, rp)
             labels = re.sub(r"[·ㆍᆞ•∙・]", "", compact(cp + rp))
             if out["trading_cost"] is None and any(s in labels for s in
                     ("매매중개", "증권거래비용", "매매수수료")):
                 out["trading_cost"] = evidence(float(number(c["text"])), n, c["text"])
+
+    # 2단계: 기존 규칙이 비워 둔 보수만 채운다. 합쳐진 머리글은 칸 위치로 나누고,
+    # '보수'가 빠진 머리글·흔한 OCR 오타를 받으며, '지급비용' 머리글의 상세표도 본다.
+    extra = [n for n in doc.tables if n not in ordered and "지급비용" in compact(
+             " ".join(c.get("text", "") for c in n.get("cells", [])[:40]))
+             and len({fee_key(c.get("text", "")) for c in n.get("cells", []) if c.get("header")} - {None}) >= 2]
+    extra += [n for n in doc.tables if n not in ordered and n not in extra
+              and any(p in extra for p in doc.continuation_headers(n))]
+    for n in ordered + extra:
+        for c, cp, rp in doc.entries(n):
+            if not usable(n, c, cp, rp):
+                continue
+            if n in extra:
+                classify(n, c)
+            if (n["id"], c["r"], c["c"]) in blocked:
+                continue
+            key = inherited_key(n, c, strict=bool(target) or n in extra)
+            if key and out["fees"][key] is None:
+                put(key, n, c, rp)
+    return fee_rows
 
 
 def financials(doc, out):
@@ -575,6 +878,9 @@ def identity_classification(doc, out):
         ident["fund_name"]["value"] = name
         if compact(name).startswith("증권상장지수"):
             ident["fund_name"] = None
+        # 본문 문장 조각(기준가격 산정 설명)이나 모투자신탁 이름은 버리고 아래 규칙으로 다시 찾는다.
+        elif re.search(r"당해종류|상당액|계상된|재무상태표|모투자신탁", compact(name)):
+            ident["fund_name"] = None
     ds["as_of_date"] = doc.metadata("as_of_date")
     if ds["as_of_date"] and dates(value(ds["as_of_date"])):
         ds["as_of_date"]["value"] = dates(value(ds["as_of_date"]))[0]
@@ -661,9 +967,12 @@ def identity_classification(doc, out):
             cls["leverage"] = implied
 
 
-def extract(data):
+def extract(data, meta=None):
+    """meta: 문서 밖에서 받은 정보. {"share_class": "S-P"}이면 그 클래스 행의 보수·수익률을 쓴다."""
     doc = Document(data)
-    out = {"identity": dict.fromkeys(("fund_name", "fund_code", "manager", "source")),
+    share_class = (meta or {}).get("share_class")
+    target = norm_class(share_class)
+    out = {"identity": dict.fromkeys(("fund_name", "fund_code", "manager", "source", "share_class")),
            "risk_grade": None,
            **{k: dict.fromkeys((*HORIZONS, "as_of_date")) for k in ("returns", "benchmark_returns", "volatility")},
            "annual_returns": None, "fees": dict.fromkeys(FEE_KEYS), "trading_cost": None,
@@ -671,10 +980,19 @@ def extract(data):
            "classification": dict.fromkeys(("benchmark_index", "fund_type", "leverage", "currency_hedge", "min_main_asset_pct")),
            "dates": dict.fromkeys(("inception_date", "listing_date", "as_of_date"))}
     identity_classification(doc, out)
-    performance(doc, out)
+    performance(doc, out, target)
     if out["dates"]["inception_date"] is None:
         out["dates"]["inception_date"] = history_inception(doc)
-    costs(doc, out)
+    fee_rows = costs(doc, out, target)
+    # 값을 읽은 클래스. 받은 클래스가 없으면 총보수를 읽은 행의 클래스를 적는다 (ETF는 보통 null).
+    if share_class:
+        out["identity"]["share_class"] = {"value": share_class, "page": None,
+                                          "node": "meta.share_class", "raw": str(share_class)}
+    elif "total" in fee_rows:
+        n, rp = fee_rows["total"]
+        code = class_code(rp)
+        if code and code != "?":
+            out["identity"]["share_class"] = evidence(code, n, rp)
     financials(doc, out)
     # 규모 축에 필요한 순자산만 남긴다. 금액은 원 단위로 합쳐 값 하나로 저장한다.
     net_assets = []
@@ -696,8 +1014,11 @@ def extract_file(path):
     if not path.name.endswith(".ocr_structure.json"):
         raise ValueError("Input must be *.ocr_structure.json (OCR only)")
     data = json.loads(path.read_text(encoding="utf-8"))
-    result = extract(data)
-    target = path.with_name(path.name.removesuffix(".ocr_structure.json") + ".fields.json")
+    stem = path.name.removesuffix(".ocr_structure.json")
+    meta_path = path.with_name(stem + ".meta.json")
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig")) if meta_path.is_file() else None
+    result = extract(data, meta)
+    target = path.with_name(stem + ".fields.json")
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     print(target.relative_to(ROOT) if target.is_relative_to(ROOT) else target)
     return target
@@ -721,6 +1042,7 @@ COLUMN_DOCS = {
     "identity.fund_name": ("펀드 정식 명칭", ""),
     "identity.manager": ("집합투자업자(운용사)", ""),
     "identity.source": ("원본 투자설명서 파일명", ""),
+    "identity.share_class": ("보수·수익률을 읽은 클래스 (meta.json으로 받은 값, 없으면 총보수를 읽은 행의 클래스. ETF는 보통 비어 있음)", ""),
     "risk_grade": ("투자위험등급. 1=매우 높은 위험 ~ 6=매우 낮은 위험", "등급"),
     "returns": ("펀드 연평균 수익률 (핵심요약 투자실적 표)", "%"),
     "benchmark_returns": ("비교지수 연평균 수익률 (같은 표)", "%"),
@@ -729,7 +1051,7 @@ COLUMN_DOCS = {
     "since_inception": ("설정일 이후", ""),
     "as_of_date": ("수치의 기준일 (표 머리글 기간의 끝 날짜)", "날짜"),
     "fees.management": ("집합투자업자(운용) 보수", "연 %"),
-    "fees.ap": ("지정참가회사 보수", "연 %"),
+    "fees.ap": ("지정참가회사 보수 (ETF) / 판매회사 보수 (일반 펀드)", "연 %"),
     "fees.trustee": ("신탁업자(수탁) 보수", "연 %"),
     "fees.admin": ("일반사무관리회사 보수", "연 %"),
     "fees.total": ("총보수 (위 보수의 합계)", "연 %"),

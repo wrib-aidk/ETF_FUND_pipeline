@@ -13,6 +13,8 @@
     python build_doc_structure_ocr.py 추출.json OCR.json [-o 출력.json]
 """
 import argparse
+import hashlib
+import inspect
 import json
 import re
 import sys
@@ -73,12 +75,10 @@ def inside_text(box, edge, orientation):
             and edge["bottom"] - edge["top"] <= (y1 - y0) * 0.9)
 
 
-def detect_edges(pixels, scale, text_boxes):
-    """쪽 이미지에서 표 선 후보를 찾는다.
+def pixel_edges(pixels, scale):
+    """쪽 이미지 픽셀만으로 찾은 선 조각 (픽셀 정수 배열: 방향 0=가로/1=세로, 위치, 시작, 끝).
 
-    색이 크게 바뀌는 경계(흰 바탕↔면, 면↔다른 색 면, 선의 양 가장자리)와, 양쪽보다 확실히 어두운 얇은 줄
-    (배경색 위에 그은 선)을 선 픽셀로 본다. 옅은 면 경계는 긴 구간만 남기는 방향별 열기로 추출한다.
-    OCR 상자에 가려진 틈을 잇고, 양 끝점까지 같은 굵은 선·이중선의 경계를 중심선으로 줄인다.
+    이미지·배율이 같으면 결과가 같아 캐시에 저장해 다시 쓴다.
     """
     color = pixels.astype(np.int16)
     step_h = np.zeros(pixels.shape[:2], dtype=np.int16)
@@ -102,15 +102,45 @@ def detect_edges(pixels, scale, text_boxes):
         for y0, y1 in runs(faint_v[:, x], MIN_FILL_V_RUN * scale):
             vertical[y0:y1, x] = True
 
-    edges = []
+    found = []
     for y in range(horizontal.shape[0]):
-        for x0, x1 in runs(horizontal[y], MIN_H_RUN * scale):
-            edges.append({"x0": x0 / scale, "x1": x1 / scale, "top": y / scale, "bottom": y / scale,
-                          "width": (x1 - x0) / scale, "height": 0, "orientation": "h"})
+        found.extend((0, y, x0, x1) for x0, x1 in runs(horizontal[y], MIN_H_RUN * scale))
     for x in range(vertical.shape[1]):
-        for y0, y1 in runs(vertical[:, x], MIN_V_RUN * scale):
-            edges.append({"x0": x / scale, "x1": x / scale, "top": y0 / scale, "bottom": y1 / scale,
-                          "width": 0, "height": (y1 - y0) / scale, "orientation": "v"})
+        found.extend((1, x, y0, y1) for y0, y1 in runs(vertical[:, x], MIN_V_RUN * scale))
+    return np.array(found, dtype=np.int32).reshape(-1, 4)
+
+
+def edges_from_pixels(found, scale):
+    """pixel_edges의 정수 배열을 pdfplumber 형식의 선 목록(pt 단위)으로 바꾼다."""
+    edges = []
+    for kind, at, a, b in found.tolist():
+        if kind == 0:
+            edges.append({"x0": a / scale, "x1": b / scale, "top": at / scale, "bottom": at / scale,
+                          "width": (b - a) / scale, "height": 0, "orientation": "h"})
+        else:
+            edges.append({"x0": at / scale, "x1": at / scale, "top": a / scale, "bottom": b / scale,
+                          "width": 0, "height": (b - a) / scale, "orientation": "v"})
+    return edges
+
+
+def edge_cache_key(image_path, scale):
+    """이미지 내용, 배율, 선 찾기 코드·상수가 모두 같을 때만 캐시를 쓴다."""
+    code = inspect.getsource(pixel_edges) + inspect.getsource(runs) + repr(
+        (COLOR_STEP, FILL_STEP, LINE_INTERIOR, LINE_CONTRAST, MIN_H_RUN, MIN_V_RUN, MIN_FILL_H_RUN, MIN_FILL_V_RUN))
+    digest = hashlib.sha1(Path(image_path).read_bytes())
+    digest.update(repr(scale).encode())
+    digest.update(code.encode())
+    return digest.hexdigest()
+
+
+def detect_edges(pixels, scale, text_boxes, raw=None):
+    """쪽 이미지에서 표 선 후보를 찾는다.
+
+    색이 크게 바뀌는 경계(흰 바탕↔면, 면↔다른 색 면, 선의 양 가장자리)와, 양쪽보다 확실히 어두운 얇은 줄
+    (배경색 위에 그은 선)을 선 픽셀로 본다. 옅은 면 경계는 긴 구간만 남기는 방향별 열기로 추출한다.
+    OCR 상자에 가려진 틈을 잇고, 양 끝점까지 같은 굵은 선·이중선의 경계를 중심선으로 줄인다.
+    """
+    edges = edges_from_pixels(raw if raw is not None else pixel_edges(pixels, scale), scale)
     edges = merge_parallel(bridge_text(snap_window(edges), text_boxes))
     edges = [e for e in edges if (e["x1"] - e["x0"] if e["orientation"] == "h" else e["bottom"] - e["top"]) >= MIN_EDGE]
     edges = [e for e in edges if not any(inside_text(b, e, e["orientation"]) for b in text_boxes)]
@@ -777,9 +807,96 @@ def nested_header_rows(boxes, children, pieces):
     return boxes
 
 
-def ruled_tables(pixels, scale, pieces, page_number, counter):
+# 보수표 머리글에 쓰이는 역할 이름. OCR이 이웃 칸의 머리글을 한 줄로 붙여 읽은 경우만 나눈다.
+FEE_HEADER_WORDS = ("집합투자업자", "판매회사", "신탁업자", "일반사무관리회사", "지정참가회사")
+
+
+def fee_header_token(text):
+    """머리글 한 칸 한 줄로 쓸 수 있는 말: '보수', 역할 이름 전체·앞·뒤 2글자 이상(+보수)."""
+    if text == "보수":
+        return True
+    core = text[:-2] if text.endswith("보수") and len(text) > 2 else text
+    return len(core) >= 2 and any(w.startswith(core) or w.endswith(core) for w in FEE_HEADER_WORDS)
+
+
+def fee_header_parts(text, count):
+    """공백 없는 줄을 머리글 말 count개로 나누는 방법이 딱 하나일 때만 그 조각들을 돌려준다."""
+    found = []
+
+    def walk(rest, parts):
+        if len(found) > 1 or len(parts) > count:
+            return
+        if not rest:
+            if len(parts) == count:
+                found.append(parts)
+            return
+        for k in range(2, len(rest) + 1):
+            if fee_header_token(rest[:k]):
+                walk(rest[k:], parts + [rest[:k]])
+
+    if "|" in text:
+        parts = [s.strip() for s in text.split("|")]
+        return parts if len(parts) == count and all(fee_header_token(s) for s in parts) else None
+    walk(text, [])
+    if len(found) != 1:
+        return None
+    whole = set(FEE_HEADER_WORDS) | {w + "보수" for w in FEE_HEADER_WORDS}
+    # 역할 이름 하나가 두 칸에 걸친 것(병합 머리글)은 나누지 않는다.
+    if any(a + b in whole for a, b in zip(found[0], found[0][1:])):
+        return None
+    return found[0]
+
+
+def split_fee_header_pieces(pieces, cells):
+    """선으로 나뉜 여러 칸에 걸친 OCR 줄을, 보수 머리글 말로만 이루어지고 말 수가 걸친 칸 수와 같을 때만 칸마다 나눈다.
+
+    좌표는 어느 칸들에 걸쳤는지와 그 순서를 알 때만 쓴다. 글자를 어디서 자를지는 말 목록으로 정한다.
+    """
+    out = []
+    for p in pieces:
+        b = p["bbox"]
+        cy = (b[1] + b[3]) / 2
+        crossed = sorted((c for c in cells if c["bbox"][1] <= cy < c["bbox"][3]
+                          and min(b[2], c["bbox"][2]) - max(b[0], c["bbox"][0]) > 1.5),
+                         key=lambda c: c["bbox"][0])
+        text = re.sub(r"\s+", "", p["text"])
+        parts = fee_header_parts(text, len(crossed)) if len(crossed) > 1 and not re.search(r"\d", text) else None
+        if not parts:
+            out.append(p)
+            continue
+        for part, c in zip(parts, crossed):
+            box = [max(b[0], c["bbox"][0]), b[1], min(b[2], c["bbox"][2]), b[3]]
+            out.append(dict(p, text=part, bbox=box, split_from=p["text"]))
+    return out
+
+
+def text_holes(cells, xs, pieces, exclude):
+    """격자 안인데 칸이 만들어지지 않은 자리에 OCR 글자가 있으면 그 자리에 칸을 만든다.
+
+    맨 왼쪽 행 이름 열이나 맨 오른쪽 열의 가로선을 못 찾으면 pdfplumber가 그 열의 칸을 만들지 않아,
+    표 테두리 안의 글자가 표 밖 문단으로 빠진다. 다른 열이 정한 행 경계와 열 경계로 칸을 만든다.
+    """
+    tops = {cell["r"]: cell["bbox"][1] for cell in cells}
+    bottoms = {cell["r"] + cell["rs"]: cell["bbox"][3] for cell in cells}
+    edges = {**tops, **bottoms}
+    covered = {(r, c) for cell in cells for r in range(cell["r"], cell["r"] + cell["rs"])
+               for c in range(cell["c"], cell["c"] + cell["cs"])}
+    added = []
+    for row in sorted(edges):
+        if row + 1 not in edges:
+            continue
+        for col in range(len(xs) - 1):
+            box = base.rounded((xs[col], edges[row], xs[col + 1], edges[row + 1]))
+            inside = pieces_in(pieces, box, exclude=exclude) if (row, col) not in covered else []
+            # 글자가 그 열 폭 안에 들어갈 때만 만든다. 여러 열에 걸친 문장은 원래대로 문단으로 둔다.
+            if inside and all(box[0] - CROSS <= q["bbox"][0] and q["bbox"][2] <= box[2] + CROSS for q in inside):
+                added.append({"r": row, "c": col, "rs": 1, "cs": 1, "bbox": box})
+    return added
+
+
+def ruled_tables(pixels, scale, pieces, page_number, counter, raw_edges=None):
     """이미지에서 찾은 선으로 표 격자를 만들고 OCR 글자를 칸에 넣는다. 규칙은 PDF 모드의 ruled_tables와 같다."""
-    edges = detect_edges(pixels, scale, [p["bbox"] for p in pieces])
+    edges = detect_edges(pixels, scale, [p["bbox"] for p in pieces], raw_edges)
     cells_found = intersections_to_cells(edges_to_intersections(edges, CROSS, CROSS))
     found = [cells for cells in cells_to_tables(cells_found) if len(cells) > 1]
     boxes = [(min(c[0] for c in t), min(c[1] for c in t), max(c[2] for c in t), max(c[3] for c in t)) for t in found]
@@ -816,7 +933,9 @@ def ruled_tables(pixels, scale, pieces, page_number, counter):
                 hole = base.grid_hole(cells, xs, child["bbox"])
                 if hole:
                     cells.append(hole)
+        cells.extend(text_holes(cells, xs, pieces, [child["bbox"] for child in children]))
         cells.sort(key=lambda cell: (cell["r"], cell["c"]))
+        table_pieces = split_fee_header_pieces(pieces_in(pieces, table["bbox"]), cells)
         holder_of = {}
         for child in children:
             best = max(range(len(cells)), key=lambda k: base.overlap_area(cells[k]["bbox"], child["bbox"]), default=None)
@@ -825,7 +944,7 @@ def ruled_tables(pixels, scale, pieces, page_number, counter):
         for k, cell in enumerate(cells):
             inner = [child["bbox"] for child in children if base.overlap_area(cell["bbox"], child["bbox"]) > 0]
             lines = [{"text": r["text"], "bbox": r["bbox"], "score": min(p["score"] for p in r["members"])}
-                     for r in rows_of(pieces_in(pieces, cell["bbox"], exclude=inner))]
+                     for r in rows_of(pieces_in(table_pieces, cell["bbox"], exclude=inner))]
             cell["child_tables"] = holder_of.get(k, [])
             if cell["child_tables"]:
                 notes, lines = base.split_notes(lines)
@@ -841,13 +960,13 @@ def ruled_tables(pixels, scale, pieces, page_number, counter):
         if regridded_rows:
             n_rows = regridded_rows
             table["regridded"] = True
-        cells, n_rows = split_merged_rows(cells, n_rows, pieces)
+        cells, n_rows = split_merged_rows(cells, n_rows, table_pieces)
         base.mark_headers(cells)
         cells, n_rows = merge_wrapped_header_dates(cells, n_rows)
         table.update(n_rows=n_rows, n_cols=n_cols, col_edges=[round(x, 1) for x in xs])
         table["header_rule"] = base.mark_headers(cells)
         correct_single_cells(cells, pixels, scale)
-        cells = split_merged_headers(cells, xs, pieces)
+        cells = split_merged_headers(cells, xs, table_pieces)
         cells, table["n_rows"] = merge_split_row_labels(cells, table["n_rows"])
         table["header_rule"] = base.mark_headers(cells)
         correct_single_cells(cells, pixels, scale)
@@ -912,7 +1031,9 @@ def correct_headers(tables, page_rows):
         for match in reversed(list(token.finditer(text))):
             word = match.group()
             if word not in replacements:
-                candidates = [w for w, count in counts.items() if count > counts[word] and confusion(word, w)]
+                # 허용하는 오독은 한 번뿐이라 길이가 2 이상 다르면 비교하지 않는다 (결과는 같고 빠르다).
+                candidates = [w for w, count in counts.items() if count > counts[word]
+                              and abs(len(w) - len(word)) <= 1 and confusion(word, w)]
                 best = max((counts[w] for w in candidates), default=0)
                 winners = [w for w in candidates if counts[w] == best]
                 replacements[word] = winners[0] if len(winners) == 1 else word
@@ -957,11 +1078,29 @@ def build(layer1_path, layer1, ocr):
     counter = Counter()
     nodes, tables, coverage = [], [], {}
     previous_toc = False
+    # 쪽 이미지의 선 찾기 결과 캐시. 후보정 규칙만 바꿨을 때 이미지 분석을 다시 하지 않는다.
+    cache_path = layer1_path.with_name(layer1_path.stem + ".edges_cache.npz")
+    edge_cache = {}
+    try:
+        with np.load(cache_path, allow_pickle=False) as saved:
+            for name in saved.files:
+                if name.endswith("|edges"):
+                    file = name[:-len("|edges")]
+                    edge_cache[file] = {"key": str(saved[file + "|key"]), "edges": saved[name]}
+    except (OSError, ValueError, KeyError):
+        edge_cache = {}
+    cache_changed = False
     for page in pages:
         number = page["page"]
-        image = Image.open(layer1_path.parent / page["file"]).convert("RGB")
+        image_path = layer1_path.parent / page["file"]
+        image = Image.open(image_path).convert("RGB")
         pixels = np.asarray(image)
         scale = image.width / page["width"]
+        key = edge_cache_key(image_path, scale)
+        cached = edge_cache.get(page["file"])
+        if not cached or cached.get("key") != key:
+            cached = edge_cache[page["file"]] = {"key": key, "edges": pixel_edges(pixels, scale)}
+            cache_changed = True
         # 반복 문구는 조각이 아니라 줄 단위로 판정한다
         # OCR마다 달라지는 머리말 띄어쓰기를 무시해 첫 표 앞에 반복 문단이 남지 않게 한다.
         dropped = {id(p) for r in page_rows[number]
@@ -970,7 +1109,7 @@ def build(layer1_path, layer1, ocr):
         pieces = [p for p in ocr_pages[number] if id(p) not in dropped]
         full_lines = rows_of(pieces)
 
-        page_tables = ruled_tables(pixels, scale, pieces, number, counter)
+        page_tables = ruled_tables(pixels, scale, pieces, number, counter, cached["edges"])
         base.link_nested(page_tables)
         # 바깥 칸의 빈 띠로 돌출된 안쪽 머리글도 이미 표가 가진 글자다. 문단으로 중복 추출하지 않는다.
         cell_boxes = [c["bbox"] for t in page_tables for c in t["cells"]]
@@ -1021,6 +1160,14 @@ def build(layer1_path, layer1, ocr):
             coverage[str(number)] = lost
         print(f"  page {number}: tables={len(page_tables)} nodes={len(page_nodes)}", flush=True)
 
+    if cache_changed:
+        live = {page["file"] for page in pages}
+        arrays = {}
+        for file, item in edge_cache.items():
+            if file in live:
+                arrays[file + "|key"], arrays[file + "|edges"] = np.array(item["key"]), item["edges"]
+        with open(cache_path, "wb") as handle:
+            np.savez_compressed(handle, **arrays)
     correct_headers(tables, page_rows)
     nodes, sections = base.finalize(nodes, tables, counter, {p["page"]: p["height"] for p in pages},
                                     ocr_margins=True)

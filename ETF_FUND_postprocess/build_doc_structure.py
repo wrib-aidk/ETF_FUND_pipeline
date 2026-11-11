@@ -1019,6 +1019,12 @@ def build_sections(nodes):
     return sections
 
 
+def inside_bbox(node, table, tolerance=2):
+    a, b = node.get("bbox"), table.get("bbox")
+    return bool(a and b) and (a[0] >= b[0] - tolerance and a[1] >= b[1] - tolerance
+                              and a[2] <= b[2] + tolerance and a[3] <= b[3] + tolerance)
+
+
 def link_continuations(nodes, page_heights=None, *, ocr_margins=False):
     """쪽 경계의 표를 연결한다. 격자가 다르면 외곽·본문 여백을 확인하고 칸의 실제 x 범위로 머리글을 잇는다."""
     def margin_key(node):
@@ -1062,6 +1068,22 @@ def link_continuations(nodes, page_heights=None, *, ocr_margins=False):
     for page in sorted(by_page):
         previous = [n for n in by_page.get(page - 1, []) if margin_key(n) not in repeated]
         current = [n for n in by_page[page] if margin_key(n) not in repeated]
+        if previous and current and (previous[-1]["type"] != "table" or current[0]["type"] != "table"):
+            # 표 칸 글자가 표 밖 문단으로 떨어져 나와 표가 쪽 끝·처음이 아니게 된 경우.
+            # 열 경계가 같은 표끼리만 그 문단을 건너뛰고 잇는다 (기존 판단은 그대로).
+            pt = [n for n in previous if n["type"] == "table"]
+            ct = [n for n in current if n["type"] == "table"]
+            if pt and ct and len(pt[-1]["col_edges"]) == len(ct[0]["col_edges"]) and all(
+                    abs(x - y) <= CONTINUE_TOLERANCE for x, y in zip(pt[-1]["col_edges"], ct[0]["col_edges"])):
+                # 쪽 아래·위 여백 띠(MARGIN_RATIO)에서 표 바깥쪽에 있는 짧은 문구(바닥글·머리글)도 건너뛴다.
+                low = (page_heights or {}).get(page - 1)
+                high = (page_heights or {}).get(page)
+                previous = [n for n in previous if n["type"] == "table" or not (
+                    inside_bbox(n, pt[-1]) or (low and n["bbox"][1] >= max(pt[-1]["bbox"][3], low * (1 - MARGIN_RATIO))
+                                               and len(n.get("text", "")) <= 60))]
+                current = [n for n in current if n["type"] == "table" or not (
+                    inside_bbox(n, ct[0]) or (high and n["bbox"][3] <= min(ct[0]["bbox"][1], high * MARGIN_RATIO)
+                                              and len(n.get("text", "")) <= 60))]
         if not previous or not current or previous[-1]["type"] != "table" or current[0]["type"] != "table":
             continue
         a, b = previous[-1], current[0]

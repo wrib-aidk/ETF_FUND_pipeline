@@ -4,11 +4,13 @@
 기본 입력은 스크립트 옆 inbox/, 결과는 output/<파일명>/에 저장한다.
 폴더는 하위 폴더까지 검색하며 .pdf와 .pdf.raw만 처리한다.
 --skip-ocr는 기존 <파일명>.server_ocr.json을 그대로 재사용한다.
+입력 PDF 옆에 <파일명>.meta.json({"share_class": "S-P"})이 있으면 그 클래스 값을 뽑는다.
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -164,8 +166,16 @@ def process(pdf, force=False, skip_ocr=False):
          [ocr_structure], [layer1, ocr, *page_images, *structure_scripts,
                            ROOT / "ETF_FUND_postprocess" / "build_doc_structure_ocr.py"], force)
     fields = folder / f"{stem}.fields.json"
+    # 입력 PDF 옆의 <문서명>.meta.json (예: {"share_class": "S-P"})은 결과 폴더로 복사해 추출에 쓴다.
+    meta_inputs = []
+    source_meta = pdf.with_name(f"{stem}.meta.json")
+    if source_meta.is_file():
+        meta = folder / source_meta.name
+        if not meta.is_file() or meta.read_bytes() != source_meta.read_bytes():
+            shutil.copyfile(source_meta, meta)
+        meta_inputs = [meta]
     step("ETF 필드", "ETF_FUND_extract/extract_fields.py", [ocr_structure], [fields],
-         [ocr_structure, ROOT / "ETF_FUND_extract" / "extract_fields.py"], force)
+         [ocr_structure, *meta_inputs, ROOT / "ETF_FUND_extract" / "extract_fields.py"], force)
     step("OCR 구조 HTML", "ETF_FUND_postprocess/render_structure.py", [ocr_structure, "-o", ocr_structure.with_suffix(".html")],
          [ocr_structure.with_suffix(".html")], [ocr_structure, ROOT / "ETF_FUND_postprocess" / "render_structure.py"], force)
     step("OCR 검토", "ETF_FUND_postprocess/review_ocr_diff.py", [pdf, layer1, structure, ocr_structure, "-o", review],

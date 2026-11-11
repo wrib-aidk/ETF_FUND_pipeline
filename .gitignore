@@ -8,3 +8,4 @@ inbox/*
 output/*
 !output/.gitkeep
 validation/
+.venv/

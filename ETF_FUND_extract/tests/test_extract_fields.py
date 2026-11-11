@@ -8,11 +8,12 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from extract_fields import extract, number, rebuild_datalake, fee_key
+from extract_fields import extract, number, rebuild_datalake, fee_key, class_code
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ETF_FUND_postprocess"))
 from build_doc_structure import document_info
 from build_doc_structure_ocr import (split_merged_headers, split_merged_rows,
-                                     merge_wrapped_header_dates, correct_single_cells)
+                                     merge_wrapped_header_dates, correct_single_cells,
+                                     split_fee_header_pieces, text_holes)
 
 
 def table(ident, grid, page=1, section=None, unit=None):
@@ -290,6 +291,75 @@ class PostprocessTests(unittest.TestCase):
         body = [self.cell(1, c, "12", [c*50, 20, (c+1)*50, 40]) for c in range(2)]
         pieces = [self.piece("금", [15, 2, 25, 12]), self.piece("액", [65, 2, 75, 12])]
         self.assertEqual(split_merged_headers([heading, *body], [0, 50, 100], pieces)[0], heading)
+
+    def test_text_hole_gets_cell_only_where_ocr_text_sits(self):
+        # 첫 열은 머리글 줄에만 칸이 있고 아래 줄은 가로선을 못 찾은 경우
+        cells = [{"r": 0, "c": c, "rs": 1, "cs": 1, "bbox": [c * 50, 0, (c + 1) * 50, 20]} for c in range(2)]
+        cells += [{"r": r, "c": 1, "rs": 1, "cs": 1, "bbox": [50, r * 20, 100, (r + 1) * 20]} for r in (1, 2)]
+        pieces = [{"text": "판매회사 보수", "bbox": [5, 22, 45, 34], "score": .9}]
+        self.assertEqual([(h["r"], h["c"]) for h in text_holes(cells, [0, 50, 100], pieces, [])], [(1, 0)])
+
+    def test_fee_header_line_split_only_by_vocabulary(self):
+        cells = [{"bbox": [x, 0, x + 50, 20]} for x in (0, 50, 100)]
+        joined = {"text": "집합투자판매회사신탁업자", "bbox": [10, 2, 140, 12], "score": .9}
+        self.assertEqual([p["text"] for p in split_fee_header_pieces([joined], cells)],
+                         ["집합투자", "판매회사", "신탁업자"])
+        # 한 이름이 두 칸에 걸친 병합 머리글과 일반 문구는 그대로 둔다.
+        for text in ("판매회사", "투자위험등급"):
+            piece = {"text": text, "bbox": [30, 2, 70, 12], "score": .9}
+            self.assertEqual(split_fee_header_pieces([piece], cells[:2]), [piece])
+
+
+class ShareClassTests(unittest.TestCase):
+    """일반 펀드(다클래스) 보완 규칙. meta가 없으면 기존 동작이어야 한다."""
+    FEES = [["구분", "지급비율", "지급비율", "지급비율"],
+            ["구분", "집합투자업자보수", "판매회사보수", "총보수"],
+            ["수수료선취-오프라인(A)", "0.40", "0.70", "1.10"],
+            ["수수료후취-온라인슈퍼(S)", "0.40", "0.30", "0.70"]]
+
+    def test_class_codes(self):
+        self.assertEqual(class_code("수수료미징구- 오프라인- 퇴직연금형(C- Rp)"), "C-Rp")
+        self.assertEqual(class_code("S-P 수수료미징구-온라인슈퍼"), "S-P")
+        self.assertEqual(class_code("종류A 수수료선취-오프라인"), "A")
+        self.assertEqual(class_code("…[채권]_S-P(수수료미징구-온라인슈퍼-개인연금)"), "S-P")
+        self.assertEqual(class_code("수수료선취-오프라인(A) 수수료미징구-오프라인(C)"), "?")
+        self.assertIsNone(class_code("삼성KODEX200증권상장지수투자신탁[주식]"))
+        self.assertIsNone(class_code("iM에셋월드골드자(주식-재간접형)(H)"))
+
+    def test_target_class_row_and_default_first_row(self):
+        data = {"nodes": [table("f", self.FEES)]}
+        default = extract(data)
+        self.assertEqual(default["fees"]["ap"]["value"], .70)
+        self.assertEqual(default["identity"]["share_class"]["value"], "A")
+        chosen = extract(data, {"share_class": "s"})
+        self.assertEqual((chosen["fees"]["ap"]["value"], chosen["fees"]["total"]["value"]), (.30, .70))
+        self.assertEqual(chosen["identity"]["share_class"]["value"], "s")
+
+    def test_unlabeled_rows_are_not_used_for_a_target_class(self):
+        grid = [row[:] for row in self.FEES[:3]]
+        grid[2][0] = "합계"
+        self.assertIsNone(extract({"nodes": [table("f", grid)]}, {"share_class": "S"})["fees"]["total"])
+
+    def test_merged_header_split_by_position(self):
+        grid = [["구분", "지급비율", "지급비율", "지급비율", "지급비율"],
+                ["구분", "집합투자업자보수", "판매회사 신탁업자 보수", "판매회사 신탁업자 보수", "총보수"],
+                ["종류A 수수료선취", "0.12", "0.19", "0.02", "0.35"]]
+        fees = extract({"nodes": [table("f", grid)]})["fees"]
+        self.assertEqual((fees["ap"]["value"], fees["trustee"]["value"]), (.19, .02))
+
+    def test_sentence_fund_name_falls_back_to_name_field(self):
+        data = {"document": {"fund_name": {"value": "은 계상된 투자신탁[당해 종류 수익증권의 상당액]"}},
+                "nodes": [{"id": "p", "type": "paragraph", "page": 1,
+                           "text": "집합투자기구 명칭: 미래에셋솔로몬장기국공채증권자투자신탁1호(채권)"}]}
+        self.assertEqual(extract(data)["identity"]["fund_name"]["value"], "미래에셋솔로몬장기국공채증권자투자신탁1호(채권)")
+
+    def test_returns_from_target_class_row(self):
+        grid = [["구분", "최근1년"], ["투자신탁", "10"], ["수수료선취-오프라인(A)", "9"],
+                ["수수료후취-온라인슈퍼(S)", "9.5"], ["비교지수", "8"]]
+        data = {"nodes": [table("r", grid)]}
+        self.assertEqual(extract(data)["returns"]["1y"]["value"], 10)
+        r = extract(data, {"share_class": "S"})
+        self.assertEqual((r["returns"]["1y"]["value"], r["benchmark_returns"]["1y"]["value"]), (9.5, 8))
 
 
 if __name__ == "__main__":
