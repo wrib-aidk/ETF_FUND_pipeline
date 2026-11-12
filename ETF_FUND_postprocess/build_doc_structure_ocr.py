@@ -38,11 +38,15 @@ MIN_FILL_H_RUN = 24  # pt. 옅은 가로 경계의 최소 길이
 MIN_FILL_V_RUN = 10  # pt. 옅은 세로 경계의 최소 길이
 SNAP = 1  # pt. 이만큼 가까운 선은 같은 선 (선 굵기 수준. 크면 붙어 있는 두 표의 테두리가 합쳐진다)
 CROSS = 1.5  # pt. 선이 이만큼 안에서 만나면 교차
+HOLE_PAD = 3  # pt. 빈 칸 자리에 넣을 OCR 글자 상자가 열 밖으로 넘쳐도 되는 폭
+CONTINUE_EDGE = 2  # pt. 쪽을 넘어 이어진 표의 열 경계가 이만큼 안이면 같은 경계
 JOIN = 3  # pt. 같은 선 위에서 이만큼 끊긴 것은 잇는다
 MIN_EDGE = 4  # pt. 합친 뒤에도 이보다 짧은 선은 버린다
 PARALLEL = 3  # pt. 굵은 선의 양쪽 경계나 이중선 사이 최대 거리 (경계 픽셀 포함)
 ENDPOINT = 2  # pt. 이중선은 양 끝점까지 같아야 한다 (안쪽 표 테두리 보호)
 ROW_OVERLAP = 0.5  # OCR 조각끼리 높이가 이 비율 이상 겹치면 같은 줄
+FRAGMENT_CHARS = 30  # 값 줄에 붙일 조각 줄의 조각별 최대 글자 수
+NUMBER_PIECE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?%?|-")
 REPEAT_PAGE_RATIO = 0.3  # 이 비율 이상의 쪽 여백에 나오면 반복 문구
 
 
@@ -75,6 +79,36 @@ def inside_text(box, edge, orientation):
             and edge["bottom"] - edge["top"] <= (y1 - y0) * 0.9)
 
 
+def row_runs(mask, min_len):
+    """2차원 참/거짓 배열의 각 행에서 길이 min_len 이상인 참 구간 (행, 시작, 끝). 행 순서, 시작 순서로 나온다.
+
+    runs()를 행마다 부른 것과 같은 결과를 배열 연산으로 한 번에 구한다.
+    """
+    rows, width = mask.shape
+    padded = np.zeros((rows, width + 2), dtype=bool)
+    padded[:, 1:-1] = mask
+    change = np.flatnonzero(padded[:, 1:] != padded[:, :-1])
+    starts, ends = change[0::2], change[1::2]
+    keep = ends - starts >= min_len
+    starts, ends = starts[keep], ends[keep]
+    row = starts // (width + 1)
+    return row, starts - row * (width + 1), ends - row * (width + 1)
+
+
+def fill_runs(mask, row, start, end):
+    """row_runs로 구한 구간을 mask에 참으로 칠한다."""
+    rows, width = mask.shape
+    # 한 행의 구간은 서로 겹치지 않아 누적합이 0 또는 1이다 (int8로 충분하다).
+    marks = np.zeros((rows, width + 1), dtype=np.int8)
+    marks[row, start] += 1
+    marks[row, end] -= 1
+    mask |= np.cumsum(marks, axis=1, dtype=np.int8)[:, :width] > 0
+
+
+def channel_max(a):
+    return np.maximum(np.maximum(a[..., 0], a[..., 1]), a[..., 2])
+
+
 def pixel_edges(pixels, scale):
     """쪽 이미지 픽셀만으로 찾은 선 조각 (픽셀 정수 배열: 방향 0=가로/1=세로, 위치, 시작, 끝).
 
@@ -83,10 +117,10 @@ def pixel_edges(pixels, scale):
     color = pixels.astype(np.int16)
     step_h = np.zeros(pixels.shape[:2], dtype=np.int16)
     step_v = np.zeros(pixels.shape[:2], dtype=np.int16)
-    step_h[1:-1] = np.abs(color[2:] - color[:-2]).max(axis=2)
-    step_v[:, 1:-1] = np.abs(color[:, 2:] - color[:, :-2]).max(axis=2)
+    step_h[1:-1] = channel_max(np.abs(color[2:] - color[:-2]))
+    step_v[:, 1:-1] = channel_max(np.abs(color[:, 2:] - color[:, :-2]))
     k = max(2, round(LINE_INTERIOR * scale))
-    light = pixels.min(axis=2).astype(np.int16)
+    light = np.minimum(np.minimum(pixels[..., 0], pixels[..., 1]), pixels[..., 2]).astype(np.int16)
     lu, ld, ll, lr = np.full_like(light, 255), np.full_like(light, 255), np.full_like(light, 255), np.full_like(light, 255)
     lu[k:], ld[:-k] = light[:-k], light[k:]
     ll[:, k:], lr[:, :-k] = light[:, :-k], light[:, k:]
@@ -95,19 +129,16 @@ def pixel_edges(pixels, scale):
 
     # 옅은 면 경계는 긴 구간만 남겨 글자 가장자리의 안티앨리어싱과 구별한다.
     faint_h, faint_v = step_h > FILL_STEP, step_v > FILL_STEP
-    for y in range(horizontal.shape[0]):
-        for x0, x1 in runs(faint_h[y], MIN_FILL_H_RUN * scale):
-            horizontal[y, x0:x1] = True
-    for x in range(vertical.shape[1]):
-        for y0, y1 in runs(faint_v[:, x], MIN_FILL_V_RUN * scale):
-            vertical[y0:y1, x] = True
+    fill_runs(horizontal, *row_runs(faint_h, MIN_FILL_H_RUN * scale))
+    vertical_t = vertical.T.copy()
+    fill_runs(vertical_t, *row_runs(faint_v.T, MIN_FILL_V_RUN * scale))
 
-    found = []
-    for y in range(horizontal.shape[0]):
-        found.extend((0, y, x0, x1) for x0, x1 in runs(horizontal[y], MIN_H_RUN * scale))
-    for x in range(vertical.shape[1]):
-        found.extend((1, x, y0, y1) for y0, y1 in runs(vertical[:, x], MIN_V_RUN * scale))
-    return np.array(found, dtype=np.int32).reshape(-1, 4)
+    h_row, h_start, h_end = row_runs(horizontal, MIN_H_RUN * scale)
+    v_col, v_start, v_end = row_runs(vertical_t, MIN_V_RUN * scale)
+    found = np.concatenate([
+        np.stack([np.zeros_like(h_row), h_row, h_start, h_end], axis=1),
+        np.stack([np.ones_like(v_col), v_col, v_start, v_end], axis=1)])
+    return found.astype(np.int32).reshape(-1, 4)
 
 
 def edges_from_pixels(found, scale):
@@ -125,7 +156,7 @@ def edges_from_pixels(found, scale):
 
 def edge_cache_key(image_path, scale):
     """이미지 내용, 배율, 선 찾기 코드·상수가 모두 같을 때만 캐시를 쓴다."""
-    code = inspect.getsource(pixel_edges) + inspect.getsource(runs) + repr(
+    code = "".join(inspect.getsource(f) for f in (pixel_edges, row_runs, fill_runs, channel_max)) + repr(
         (COLOR_STEP, FILL_STEP, LINE_INTERIOR, LINE_CONTRAST, MIN_H_RUN, MIN_V_RUN, MIN_FILL_H_RUN, MIN_FILL_V_RUN))
     digest = hashlib.sha1(Path(image_path).read_bytes())
     digest.update(repr(scale).encode())
@@ -327,6 +358,79 @@ def rows_of(pieces):
     return [r for r in rows if r["text"]]
 
 
+def attach_row_fragments(rows):
+    """선 없는 표에서 값 줄과 반쯤 겹친 짧은 조각 줄(두 줄로 감긴 행 이름, 병합 칸의 날짜)을 그 값 줄에 붙인다.
+
+    rows_of는 높이가 ROW_OVERLAP 이상 겹칠 때만 같은 줄로 본다. 두 줄 행 이름은 값 줄 위아래로 조금씩만 겹쳐
+    따로 줄이 되고, 겹친 줄 때문에 선 없는 표가 끊긴다. 숫자 조각이 3개 이상인 줄과 겹치고 가로로는
+    그 줄의 어떤 조각과도 부딪히지 않는 짧은 줄만 붙인다. 값 줄의 높이는 그대로 둔다.
+    """
+    def numbers(row):
+        return sum(bool(NUMBER_PIECE.fullmatch(p["text"].strip())) for p in row["members"])
+
+    def overlap(a, b):
+        return min(a["bbox"][3], b["bbox"][3]) - max(a["bbox"][1], b["bbox"][1])
+
+    targets = [r for r in rows if numbers(r) >= 3]
+    # 가로 충돌은 값 줄의 원래 조각과만 본다. 같은 열에 쌓인 감긴 행 이름 두 줄을 모두 붙이기 위해서다.
+    original = {id(t): list(t["members"]) for t in targets}
+    target_ids = {id(r) for r in targets}
+    merged, grown = set(), set()
+    for row in rows:
+        # 숫자 조각은 붙이지 않는다 (그래프 눈금·값 칸 글자). 행 이름과 날짜 같은 글자 조각만 붙인다.
+        if id(row) in target_ids or numbers(row) >= 1 or len(row["members"]) > 2 \
+                or any(len(p["text"].strip()) > FRAGMENT_CHARS for p in row["members"]):
+            continue
+        # 붙인 조각이 값 줄의 옆 칸 글자와 한 칸으로 합쳐지지 않을 만큼 떨어져 있어야 한다 (segments 기준).
+        near = [t for t in targets if overlap(row, t) > 0 and not any(
+            min(p["bbox"][2], q["bbox"][2]) + (t["bbox"][3] - t["bbox"][1]) * base.ALIGNED_GAP_RATIO
+            > max(p["bbox"][0], q["bbox"][0])
+            for p in row["members"] for q in original[id(t)])]
+        if not near:
+            continue
+        target = max(near, key=lambda t: overlap(row, t))
+        target["members"].extend(row["members"])
+        merged.add(id(row))
+        grown.add(id(target))
+    out = []
+    for row in rows:
+        if id(row) in merged:
+            continue
+        if id(row) in grown:
+            # 같은 열에 쌓인 조각(감긴 행 이름)은 위에서 아래 순서로, 나머지는 왼쪽부터 둔다.
+            ordered, column = [], []
+            for piece in sorted(row["members"], key=lambda p: p["bbox"][0]):
+                if column and piece["bbox"][0] < max(q["bbox"][2] for q in column):
+                    column.append(piece)
+                else:
+                    ordered.extend(sorted(column, key=lambda q: q["bbox"][1]))
+                    column = [piece]
+            ordered.extend(sorted(column, key=lambda q: q["bbox"][1]))
+            row["members"] = ordered
+            row["text"] = " ".join(p["text"].strip() for p in ordered).strip()
+        out.append(row)
+    return out
+
+
+def split_period_cells(cells, col_edges):
+    """선 없는 표에서 여러 열에 걸친 기간 머리글 칸을 열마다 나눈다.
+
+    OCR이 '최근1년 최근 2년 … 설정일 이후'나 '25.04.15 24.04.15 …'를 한 조각으로 읽은 경우다.
+    기간 토막 수가 걸친 열 수와 정확히 같을 때만 나눈다.
+    """
+    out = []
+    for cell in cells:
+        tokens = re.findall(base.PERIOD_TOKEN, cell["text"])
+        if cell["cs"] > 1 and len(tokens) == cell["cs"] and base.PERIOD_HEADER.fullmatch(cell["text"]):
+            for k, token in enumerate(tokens):
+                c = cell["c"] + k
+                out.append(dict(cell, c=c, cs=1, text=token.strip(), lines=[token.strip()],
+                                bbox=base.rounded((col_edges[c], cell["bbox"][1], col_edges[c + 1], cell["bbox"][3]))))
+        else:
+            out.append(cell)
+    return out
+
+
 def segments(row):
     """선 없는 표용 칸 후보: 줄 안의 OCR 조각을 큰 간격에서 나눈다."""
     height = row["bbox"][3] - row["bbox"][1]
@@ -422,8 +526,13 @@ def split_merged_headers(cells, xs, pieces):
                 break
             ends = [0, *map(round, indices), len(text)]
             edges = [b[0], *cuts, b[2]]
-            for left, right, start, end in zip(edges, edges[1:], ends, ends[1:]):
-                c = next(c for c in cols if xs[c] <= (left + right) / 2 < xs[c + 1])
+            spans = [(next((c for c in cols if xs[c] <= (left + right) / 2 < xs[c + 1]), None), left, right, start, end)
+                     for left, right, start, end in zip(edges, edges[1:], ends, ends[1:])]
+            if any(c is None for c, *_ in spans):
+                # 조각이 칸 밖으로 삐져나와 나눈 조각 하나가 어느 열에도 들지 않으면 나누지 않는다.
+                valid = False
+                break
+            for c, left, right, start, end in spans:
                 groups[c].append(dict(piece, text=text[start:end], bbox=[left, b[1], right, b[3]]))
         if not valid or (crossing and crossing < 2) or set(groups) != set(cols):
             result.extend(originals)
@@ -889,12 +998,40 @@ def text_holes(cells, xs, pieces, exclude):
             box = base.rounded((xs[col], edges[row], xs[col + 1], edges[row + 1]))
             inside = pieces_in(pieces, box, exclude=exclude) if (row, col) not in covered else []
             # 글자가 그 열 폭 안에 들어갈 때만 만든다. 여러 열에 걸친 문장은 원래대로 문단으로 둔다.
-            if inside and all(box[0] - CROSS <= q["bbox"][0] and q["bbox"][2] <= box[2] + CROSS for q in inside):
+            # OCR 글자 상자는 실제 글자보다 조금 넓게 잡히므로 HOLE_PAD만큼은 넘쳐도 된다.
+            if inside and all(box[0] - HOLE_PAD <= q["bbox"][0] and q["bbox"][2] <= box[2] + HOLE_PAD for q in inside):
                 added.append({"r": row, "c": col, "rs": 1, "cs": 1, "bbox": box})
     return added
 
 
-def ruled_tables(pixels, scale, pieces, page_number, counter, raw_edges=None):
+def restore_outer_columns(cells, xs, prior_xs, pieces, box):
+    """앞 쪽 표에서 이어진 표가 바깥 열의 세로선을 못 찾아 안쪽 열만 남은 경우 앞 표의 열 경계로 되살린다.
+
+    열 경계가 앞 표 열 경계의 연속된 일부와 같고, 빠진 바깥 띠에 표 높이 안의 OCR 글자가 있을 때만 늘린다.
+    늘린 열의 칸은 text_holes가 다른 열의 행 경계로 만든다.
+    """
+    if not prior_xs or len(xs) < 3 or len(prior_xs) <= len(xs):
+        return xs, 0
+    for k in range(len(prior_xs) - len(xs) + 1):
+        if all(abs(x - y) <= CONTINUE_EDGE for x, y in zip(xs, prior_xs[k:k + len(xs)])):
+            break
+    else:
+        return xs, 0
+
+    def has_text(x0, x1):
+        return any(x0 - CROSS <= q["bbox"][0] and q["bbox"][2] <= x1 + CROSS
+                   and box[1] <= base.center(q["bbox"])[1] <= box[3] for q in pieces)
+
+    left = prior_xs[:k] if k and has_text(prior_xs[0], xs[0]) else []
+    right = prior_xs[k + len(xs):]
+    right = right if right and has_text(xs[-1], right[-1]) else []
+    if left:
+        for cell in cells:
+            cell["c"] += len(left)
+    return list(left) + list(xs) + list(right), len(left)
+
+
+def ruled_tables(pixels, scale, pieces, page_number, counter, raw_edges=None, prior_xs=None):
     """이미지에서 찾은 선으로 표 격자를 만들고 OCR 글자를 칸에 넣는다. 규칙은 PDF 모드의 ruled_tables와 같다."""
     edges = detect_edges(pixels, scale, [p["bbox"] for p in pieces], raw_edges)
     cells_found = intersections_to_cells(edges_to_intersections(edges, CROSS, CROSS))
@@ -922,12 +1059,20 @@ def ruled_tables(pixels, scale, pieces, page_number, counter, raw_edges=None):
             parent = parent_of(parent)
         tables[i]["parent_index"] = parent
 
+    roots = [i for i in kept if tables[i]["parent_index"] is None]
+    top = min(roots, key=lambda i: boxes[i][1], default=None)
     for i in kept:
         table = tables[i]
         children = [tables[j] for j in kept if tables[j]["parent_index"] == i]
         boxes_for_grid = nested_header_rows(disjoint_cells(found[i]),
                                            [found[j] for j in kept if tables[j]["parent_index"] == i], pieces)
         cells, n_rows, n_cols, xs = base.make_grid(boxes_for_grid)
+        # 쪽 맨 위 표만 앞 쪽 표의 열 경계로 바깥 열을 되살린다.
+        if i == top and len(xs) > 2:
+            restored = restore_outer_columns(cells, xs, prior_xs, pieces, boxes[i])[0]
+            if len(restored) != len(xs):
+                xs, n_cols = restored, len(restored) - 1
+                table["bbox"] = base.rounded((min(xs[0], boxes[i][0]), boxes[i][1], max(xs[-1], boxes[i][2]), boxes[i][3]))
         for child in children:
             if not any(base.overlap_area(cell["bbox"], child["bbox"]) for cell in cells):
                 hole = base.grid_hole(cells, xs, child["bbox"])
@@ -1090,6 +1235,7 @@ def build(layer1_path, layer1, ocr):
     except (OSError, ValueError, KeyError):
         edge_cache = {}
     cache_changed = False
+    prior_xs, prior_page = None, None
     for page in pages:
         number = page["page"]
         image_path = layer1_path.parent / page["file"]
@@ -1109,17 +1255,22 @@ def build(layer1_path, layer1, ocr):
         pieces = [p for p in ocr_pages[number] if id(p) not in dropped]
         full_lines = rows_of(pieces)
 
-        page_tables = ruled_tables(pixels, scale, pieces, number, counter, cached["edges"])
+        page_tables = ruled_tables(pixels, scale, pieces, number, counter, cached["edges"],
+                                   prior_xs=prior_xs if prior_page == number - 1 else None)
+        outer = [t for t in page_tables if t.get("parent_index") is None]
+        if outer:
+            prior_xs, prior_page = max(outer, key=lambda t: t["bbox"][3])["col_edges"], number
         base.link_nested(page_tables)
         # 바깥 칸의 빈 띠로 돌출된 안쪽 머리글도 이미 표가 가진 글자다. 문단으로 중복 추출하지 않는다.
         cell_boxes = [c["bbox"] for t in page_tables for c in t["cells"]]
         free = [p for p in pieces if not any(base.inside(b, *base.center(p["bbox"])) for b in cell_boxes)]
-        rows = rows_of(free)
+        rows = attach_row_fragments(rows_of(free))
         lines = [{"text": r["text"], "bbox": r["bbox"]} for r in rows]
         free_tables, used = base.aligned_tables(None, number, lines, counter,
                                                 segs=[segments(r) for r in rows], source="ocr")
         for table in free_tables:
-            cells, table["n_rows"] = merge_split_row_labels(table["cells"], table["n_rows"])
+            cells, table["n_rows"] = merge_split_row_labels(split_period_cells(table["cells"], table["col_edges"]),
+                                                            table["n_rows"])
             for cell in cells:
                 cell.pop("_lines", None)
             base.mark_aligned_headers(cells)

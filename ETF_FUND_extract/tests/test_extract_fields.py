@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from extract_fields import extract, number, rebuild_datalake, fee_key, class_code
+from extract_fields import extract, number, rebuild_datalake, fee_key, class_code, spread_role, fee_key_loose
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ETF_FUND_postprocess"))
 from build_doc_structure import document_info
 from build_doc_structure_ocr import (split_merged_headers, split_merged_rows,
@@ -24,6 +24,21 @@ def table(ident, grid, page=1, section=None, unit=None):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_spread_role_merged_neighbour_headers(self):
+        # OCR이 '집합투자/판매회사/수탁회사' 윗줄을 가운데 칸에 붙이고 양옆에는 조각만 남긴 머리글
+        heads = ["클래스", "업자 보수", "집합투자판매회사수탁회사 보수", "보수", "일반사무 관리회사 보수"]
+        n = {"cells": [{"r": 0, "c": c, "cs": 1, "header": True, "text": t} for c, t in enumerate(heads)]}
+        roles = [spread_role(n, {"c": c}, n["cells"][c]) for c in range(5)]
+        self.assertEqual(roles, [None, "management", "ap", "trustee", None])
+        # 양옆이 조각이 아니면(문장 칸) 나누지 않는다.
+        n["cells"][3]["text"] = "보수 인하"
+        self.assertIsNone(spread_role(n, {"c": 2}, n["cells"][2]))
+
+    def test_fee_header_ocr_typos(self):
+        self.assertEqual(fee_key_loose("완리회자 일반산문 '보수'"), "admin")
+        self.assertEqual(fee_key_loose("신탈 업자 보수"), "trustee")
+        self.assertIsNone(fee_key_loose("판매 수수료"))
+
     def test_fee_dot_variants_and_sum(self):
         for dot in ("·", "ㆍ", "•", "∙", "・", "ᆞ"):
             self.assertEqual(fee_key("총보수 " + dot + "비용"), "ter")
@@ -59,6 +74,37 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(r["annual_returns"][1]["period"]["value"], "2022-03-01/2023-02-28")
         self.assertIn("기준일", r["annual_returns"][0]["period"]["raw"])
 
+    def test_target_annual_without_benchmark_and_short_years(self):
+        annual = table("a", [["연도", "최근 1년차", "최근 2년차"],
+                             ["기간", "25.06.01~26.05.31", "25.02.26~25.05.31"],
+                             ["종류A 수수료선취", "99", "88"],
+                             ["종류S 수수료후취-온라인슈퍼", "56.47", "-"]], section="perf")
+        data = {"nodes": [annual], "sections": [{"id": "perf", "path": ["집합투자기구의 운용실적"]}]}
+        item, = extract(data, {"share_class": "S"})["annual_returns"]
+        self.assertEqual((item["year"]["value"], item["fund"]["value"]), (2026, 56.47))
+        self.assertEqual(item["period"]["value"], "2025-06-01/2026-05-31")
+        self.assertIsNone(extract(data)["annual_returns"])
+
+    def test_target_annual_incomplete_end_uses_as_of(self):
+        annual = table("a", [["종류", "최근 1년차", "최근 2년차"],
+                             ["기간", "2025/05/21 2026/05/2", "2024/05/21 2025/05/"],
+                             ["Class S-P", "99", "88"], ["Class S", "33.64", "4.15"]], section="perf")
+        data = {"document": {"as_of_date": "2026.05.20"}, "nodes": [annual],
+                "sections": [{"id": "perf", "path": ["집합투자기구의 운용실적"]}]}
+        items = extract(data, {"share_class": "S"})["annual_returns"]
+        self.assertEqual([(i["year"]["value"], i["fund"]["value"], i["period"]["value"]) for i in items],
+                         [(2026, 33.64, "2025-05-21/2026-05-20"), (2025, 4.15, "2024-05-21/2025-05-20")])
+
+    def test_target_ter_conjunction_in_inherited_header(self):
+        head = table("h", [["종류", "총보수", "기타비용", "총보수 및 비용"],
+                           ["A", "1.0", ".02", "1.02"]], section="fee")
+        tail = table("t", [["S", ".5", ".0043", ".5043"], ["S-P", ".4", ".004", ".404"]], page=2)
+        tail["continued_from"] = "h"
+        data = {"nodes": [head, tail], "sections": [{"id": "fee", "path": ["보수 및 수수료"]}]}
+        fees = extract(data, {"share_class": "S"})["fees"]
+        self.assertEqual((fees["total"]["value"], fees["ter"]["value"], fees["ter"]["node"]), (.5, .5043, "t"))
+        self.assertIsNone(extract(data)["fees"]["ter"])
+
     def test_benchmark_labels_and_quotes(self):
         for text, expected in [('거래소가 발표하는 "SAMPLE123"의 수익률을 추적', "SAMPLE123"),
                                ("기초지수(추적대상지수):SAMPLE123100%", "SAMPLE123")]:
@@ -90,10 +136,10 @@ class ExtractionTests(unittest.TestCase):
         tax = {"id": "tax", "type": "paragraph", "page": 1,
                "text": "증권 시장에 상장된 증권(채권 등 제외) 및 선물"}
         self.assertIsNone(extract({"nodes": [tax]})["classification"]["fund_type"])
-        for label in ("주식형", "채권형", "혼합형", "재간접형", "주식혼합형", "채권혼합형"):
+        for label in ("주식형", "채권형", "혼합형", "재간접형", "주식혼합형", "채권혼합형", "주식-파생형"):
             row = table("class", [["분류", f"투자신탁, 증권형({label}), 개방형"]])
             item = extract({"nodes": [tax, row]})["classification"]["fund_type"]
-            self.assertEqual(item["value"], f"증권({label})")
+            self.assertEqual(item["value"], f"증권({label.replace('-', '')})")
             self.assertEqual(item["node"], "class")
         result = extract({"document": {"fund_name": {"value": "예시상장지수투자신탁[주식]", "page": 1}},
                           "nodes": [tax]})
@@ -175,6 +221,9 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(r["net_assets"][0]["amount"]["value"], 90_000_000)
         self.assertEqual(r["net_assets"][0]["period"]["value"], "2025-12-31")
         self.assertNotIn("financials", r)
+        for head in ("2025.1.1-2025.12.31", "20251231"):  # '-' 기간, 붙여 쓴 날짜
+            t = table("s", [["요약재무정보", head], ["자본총계", "7"]], unit="단위:원")
+            self.assertEqual(extract({"nodes": [t]})["net_assets"][0]["period"]["value"], "2025-12-31")
 
     def test_datalake_flat_csv_and_nulls(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -191,9 +240,11 @@ class ExtractionTests(unittest.TestCase):
             with csv_path.open(encoding="utf-8-sig", newline="") as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(rows[0]["returns.1y"], "1.0")
-            self.assertEqual(rows[0]["returns.1y.page"], "1")
+            self.assertNotIn("returns.1y.page", rows[0])
             self.assertNotIn("returns.1y.node", rows[0])
             self.assertEqual(rows[0]["risk_grade"], "")
+            line = json.loads((output / "datalake/etf_fields.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(line["returns"]["1y"], 1.0)
 
 
 class PostprocessTests(unittest.TestCase):
@@ -325,6 +376,37 @@ class ShareClassTests(unittest.TestCase):
         self.assertEqual(class_code("수수료선취-오프라인(A) 수수료미징구-오프라인(C)"), "?")
         self.assertIsNone(class_code("삼성KODEX200증권상장지수투자신탁[주식]"))
         self.assertIsNone(class_code("iM에셋월드골드자(주식-재간접형)(H)"))
+        self.assertEqual(class_code("거북이 90 증권 자투자신탁 1 호(주식)S-P2016-07-05"), "S-P")
+        self.assertIsNone(class_code("거북이 90 증권 자투자신탁 1 호(주식)(운용)"))
+        self.assertEqual(class_code("수수료후취-온라인슈퍼형(S"), "S")
+
+    def test_benchmark_formula_and_label_on_next_line(self):
+        for texts, name in ((["비교지수:(KOSPI 지수 × 95%) +(CD 91일물 × 5%)"], "KOSPI 지수"),
+                            (["※ 비교지수:", "[KOSPI대형주지수]x30%+[KOSPI중형주지수]x70%"], "KOSPI대형주지수"),
+                            (["(3)투자신탁의 비교지수(벤치마크)", "- KOSPI100%"], "KOSPI"),
+                            (["비교지수: 해당사항 없음"], None)):
+            nodes = [{"id": f"p{i}", "type": "paragraph", "page": 1, "text": t} for i, t in enumerate(texts)]
+            got = extract({"nodes": nodes})["classification"]["benchmark_index"]
+            self.assertEqual(got and got["value"], name)
+
+    def test_target_class_returns_repairs(self):
+        # 합쳐진 '클래스 + 비교지수' 행은 펀드 값, 빈 괄호 코드는 같은 문서의 설명으로 찾는다.
+        grid = [["구분", "최근1년"], ["수수료선취-오프라인(A) 비교지수", "9"],
+                ["수수료미징구-온라인슈퍼-개인연금(S-P) 비교지수", "9.5"]]
+        r = extract({"nodes": [table("r", grid)]}, {"share_class": "S-P"})
+        self.assertEqual((r["returns"]["1y"]["value"], r["benchmark_returns"]["1y"]), (9.5, None))
+        lost = [["구분", "최근1년"], ["수수료후취-온라인슈퍼()", "7"], ["비교지수", "6"]]
+        nodes = [{"id": "p", "type": "paragraph", "page": 1, "text": "수수료후취-온라인슈퍼(S)"}, table("r", lost)]
+        self.assertEqual(extract({"nodes": nodes}, {"share_class": "S"})["returns"]["1y"]["value"], 7)
+
+    def test_target_class_benchmark_and_volatility_from_own_group(self):
+        # 비교지수·변동성은 받은 클래스 행 바로 아래 묶음에서 읽는다. 그 클래스 값이 '-'이면 빈칸이다.
+        grid = [["구분", "최근1년", "설정일이후"],
+                ["수수료미징구-오프라인(C)", "10", "8"], ["비교지수", "5", "4"], ["수익률변동성", "3", "2"],
+                ["수수료후취-온라인슈퍼(S)", "11", "9"], ["비교지수", "5", "6"], ["수익률변동성", "-", "7"]]
+        r = extract({"nodes": [table("r", grid)]}, {"share_class": "S"})
+        self.assertEqual((r["benchmark_returns"]["since_inception"]["value"], r["volatility"]["since_inception"]["value"],
+                          r["volatility"]["1y"]), (6, 7, None))
 
     def test_target_class_row_and_default_first_row(self):
         data = {"nodes": [table("f", self.FEES)]}
@@ -334,6 +416,16 @@ class ShareClassTests(unittest.TestCase):
         chosen = extract(data, {"share_class": "s"})
         self.assertEqual((chosen["fees"]["ap"]["value"], chosen["fees"]["total"]["value"]), (.30, .70))
         self.assertEqual(chosen["identity"]["share_class"]["value"], "s")
+
+    def test_transposed_trading_cost_rate_only(self):
+        grid = [["구분", "지급비율", "지급비율"], ["구분", "C-P", "S-P"],
+                ["총보수", "1.49", "0.96"], ["증권거래비용", "0.3495", "0.3472"]]
+        for g in (grid, grid[:3] + [["증권거래비용", "17,605", "17,605"]]):
+            t = table("f", g)
+            for c in t["cells"]:
+                c["col_path"] = [g[0][c["c"]], g[1][c["c"]]]
+            got = extract({"nodes": [t]}, {"share_class": "S-P"})["trading_cost"]
+            self.assertEqual(got and got["value"], .3472 if g is grid else None)
 
     def test_unlabeled_rows_are_not_used_for_a_target_class(self):
         grid = [row[:] for row in self.FEES[:3]]

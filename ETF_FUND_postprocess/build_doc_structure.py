@@ -27,6 +27,9 @@ STRUCTURE_VERSION = 1
 NUMERIC = re.compile(r"^[-+]?\(?[\d,]*\.?\d+\)?\s*%?$|^-$")
 NOTE = re.compile(r"^\s*(\(\s*주\s*\d*\s*\)|주\s*\d+\s*\)|※|\*\s)")
 UNIT = re.compile(r"^[\[(<]?\s*단위\s*[:：]\s*[^\])>]+[\])>]?$")
+# 기간 머리글 한 토막: 최근1년, 최근 2년차, 설정일 이후, 25.04.15, ~26.04.14
+PERIOD_TOKEN = r"(?:최근\s*\d+\s*년\s*차?|설정\s*일?\s*이\s*후|~?\s*\d{2,4}[./]\d{1,2}[./]\d{1,2})"
+PERIOD_HEADER = re.compile(rf"\s*{PERIOD_TOKEN}(?:\s+{PERIOD_TOKEN})+\s*")
 CAPTION = re.compile(r"^\s*[<\[【〈《].{1,60}[>\]】〉》]\s*$")
 TOC_LINE = re.compile(r"(?:[.…·]\s*){2,}\d+\s*$")
 SENTENCE_END = re.compile(r"(다|요|음|함|임)\s*[.。]?$|[.!?。]$")
@@ -660,6 +663,8 @@ def aligned_tables(page, page_number, lines, counter, segs=None, source="pdf_tex
 
         while start > 0 and start - 1 not in used and near(start - 1, start) and (
             len(segs[start - 1]) >= 2 or (start > 1 and len(segs[start - 2]) >= 2 and near(start - 2, start - 1))
+            # OCR이 기간 머리글 줄 전체를 한 조각으로 읽은 경우 (선 없는 수익률 표)
+            or (source == "ocr" and PERIOD_HEADER.fullmatch(lines[start - 1]["text"]))
         ) and not NOTE.match(lines[start - 1]["text"]) and not UNIT.match(lines[start - 1]["text"]):
             start -= 1
         while end + 1 < len(lines) and near(end, end + 1) and len(segs[end + 1]) >= 2 and not NOTE.match(lines[end + 1]["text"]):
@@ -669,13 +674,22 @@ def aligned_tables(page, page_number, lines, counter, segs=None, source="pdf_tex
             i = end + 1
             continue
         # 열 띠: 모든 칸의 가로 구간을 겹치는 것끼리 합친다
-        intervals = sorted((s["bbox"][0], s["bbox"][2]) for r in rows for s in segs[r])
-        bands = []
-        for x0, x1 in intervals:
-            if bands and x0 <= bands[-1][1]:
-                bands[-1][1] = max(bands[-1][1], x1)
-            else:
-                bands.append([x0, x1])
+        def merged_bands(intervals):
+            bands = []
+            for x0, x1 in sorted(intervals):
+                if bands and x0 <= bands[-1][1]:
+                    bands[-1][1] = max(bands[-1][1], x1)
+                else:
+                    bands.append([x0, x1])
+            return bands
+
+        bands = merged_bands((s["bbox"][0], s["bbox"][2]) for r in rows for s in segs[r])
+        if source == "ocr":
+            # OCR은 머리글의 여러 기간을 한 조각으로 읽기도 한다. 그 조각 때문에 값 열이 하나로 뭉치면
+            # 숫자 줄만으로 열을 정하고, 넓은 머리글 칸은 여러 열에 걸친 칸으로 둔다.
+            numeric_bands = merged_bands((s["bbox"][0], s["bbox"][2]) for r in rows if numeric_rich[r] for s in segs[r])
+            if len(numeric_bands) > len(bands):
+                bands = numeric_bands
         if len(bands) < 3:
             i = end + 1
             continue
@@ -683,6 +697,10 @@ def aligned_tables(page, page_number, lines, counter, segs=None, source="pdf_tex
         for row_index, r in enumerate(rows):
             for seg in segs[r]:
                 covered = [k for k, band in enumerate(bands) if seg["bbox"][0] < band[1] and seg["bbox"][2] > band[0]]
+                if not covered:
+                    # 숫자 열 사이 빈 띠에 놓인 글자는 가까운 열에 둔다.
+                    middle = (seg["bbox"][0] + seg["bbox"][2]) / 2
+                    covered = [min(range(len(bands)), key=lambda k: min(abs(middle - bands[k][0]), abs(middle - bands[k][1])))]
                 cells.append({"r": row_index, "c": covered[0], "rs": 1, "cs": len(covered), "bbox": seg["bbox"],
                               "text": seg["text"], "lines": [seg["text"]], "source": source, "fill": None})
         counter["table"] += 1
@@ -1095,6 +1113,39 @@ def link_continuations(nodes, page_heights=None, *, ocr_margins=False):
                        and a["bbox"][3] >= page_heights[page - 1] * (1 - MARGIN_RATIO)
                        and b["bbox"][1] <= page_heights[page] * MARGIN_RATIO)
         same_frame = all(abs(a["bbox"][i] - b["bbox"][i]) <= CONTINUE_TOLERANCE for i in (0, 2))
+        if not (same_grid or (at_boundary and same_frame)):
+            # 앞 쪽 표 격자에 글자 없는 가짜 열이 끼어 열 수가 달라진 경우: 양끝의 빈 열(외곽이 달라짐)과
+            # 겹선이 만든 좁은 빈 열(CONTINUE_TOLERANCE보다 좁음). 그 열만 떼어 낸 격자가 다음 표 격자와
+            # 같을 때만 잇고, 머리글을 열 번호로 물려받도록 앞 표의 열 번호를 맞춘다.
+            edges = list(a["col_edges"])
+            used = {col for c in a["cells"] if c.get("text", "").strip() for col in range(c["c"], c["c"] + c.get("cs", 1))}
+            # 글자 칸이 그 열 하나에만 걸친 열 (여러 열에 걸친 머리글만 지나가는 좁은 열은 가짜 열로 본다)
+            alone = {c["c"] for c in a["cells"] if c.get("text", "").strip() and c.get("cs", 1) == 1}
+            lo, hi = 0, len(edges) - 1
+            while lo < hi - 1 and lo not in used:
+                lo += 1
+            while hi > lo + 1 and hi - 1 not in used:
+                hi -= 1
+            tiny = {k for k in range(lo, hi) if edges[k + 1] - edges[k] < CONTINUE_TOLERANCE and k not in alone}
+            kept = [k for k in range(lo, hi) if k not in tiny]
+            trimmed = [edges[lo]] + [edges[k + 1] for k in kept]
+            same_grid = bool(kept) and (len(trimmed) < len(edges) and len(trimmed) == len(b["col_edges"]) and all(
+                abs(x - y) <= CONTINUE_TOLERANCE for x, y in zip(trimmed, b["col_edges"])))
+            if same_grid:
+                # 좁은 빈 열은 오른쪽 열에 붙인다 (맨 끝이면 왼쪽 열).
+                index = {k: min(sum(1 for q in kept if q < k), len(kept) - 1) for k in range(lo, hi)}
+                cells = []
+                for cell in a["cells"]:
+                    cols = [k for k in range(cell["c"], cell["c"] + cell.get("cs", 1)) if lo <= k < hi]
+                    if not cols or (all(k in tiny for k in cols) and not cell.get("text", "").strip()) or (
+                            cell.get("cs", 1) == 1 and cols[0] in tiny):
+                        continue
+                    start, end = min(index[k] for k in cols), max(index[k] for k in cols) + 1
+                    cells.append(dict(cell, c=start, cs=end - start))
+                a["cells"] = cells
+                a["col_edges"] = trimmed
+                a["n_cols"] = len(trimmed) - 1
+                a["bbox"] = [trimmed[0], a["bbox"][1], trimmed[-1], a["bbox"][3]]
         if same_grid or (at_boundary and same_frame):
             b["continued_from"] = a["id"]
             if not same_grid or a is not by_page[page - 1][-1] or b is not by_page[page][0]:

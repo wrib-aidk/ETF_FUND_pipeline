@@ -44,8 +44,8 @@ flowchart LR
 
 | 파일 | 내용 |
 |---|---|
-| `etf_fields.jsonl` | 문서당 한 줄 JSON |
-| `etf_fields.csv.raw` | 엑셀용 평면 표 (UTF-8 BOM). 값과 쪽 번호만 담음 |
+| `etf_fields.jsonl` | 문서당 한 줄 JSON. 값만 담음 (출처는 문서별 `fields.json`) |
+| `etf_fields.csv.raw` | 엑셀용 평면 표 (UTF-8 BOM). 값만 담음 |
 | `etf_fields_columns.csv.raw` | 컬럼 사전 (컬럼, 설명, 단위) |
 | `coverage.md` | 항목 × 문서별 추출 현황 |
 

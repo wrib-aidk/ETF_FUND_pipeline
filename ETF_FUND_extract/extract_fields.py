@@ -126,6 +126,18 @@ FEE_ROLES = (("management", r"집합투자업자|집합투자"), ("ap", r"판매
              ("trustee", r"신탁업자|수탁회사"), ("admin", r"일반사무|사무관리"))
 
 
+# 보수표 머리글에서 실제로 확인된 OCR 오타. 기존 규칙이 못 읽은 머리글에만 쓴다.
+HEADER_TYPOS = (("보쉬", "보수"), ("보주", "보수"), ("보숭", "보수"), ("산문", "사무"), ("완리", "관리"),
+                ("회자", "회사"), ("신탈", "신탁"))
+
+
+def fix_header_typos(text):
+    s = re.sub(r"[^0-9A-Za-z가-힣%]", "", compact(text))
+    for wrong, right in HEADER_TYPOS:
+        s = s.replace(wrong, right)
+    return s
+
+
 def fee_key_loose(text):
     """Header words without '보수' or with common OCR typos (판매 회사, 신탈 보수, 사문 보수)."""
     s = re.sub(r"[·ㆍᆞ•∙・.,()\[\]①-⑳]", "", compact(text))
@@ -139,6 +151,10 @@ def fee_key_loose(text):
         return "trustee"
     if re.fullmatch(r"(?:일반)?(?:사무관리|사문|사무)(?:회사)?(?:보수)?", s) and s not in ("사무", "일반사무"):
         return "admin"
+    fixed = fix_header_typos(s)
+    if fixed != re.sub(r"[^0-9A-Za-z가-힣%]", "", s):
+        # '완리회자 일반산문 보수'(관리회사 일반사무 보수)처럼 OCR 오타가 든 머리글
+        return fee_key(fixed) if "수수료" not in fixed else None
     return None
 
 
@@ -166,11 +182,28 @@ def class_code(label):
     codes = []
     if "수수료" in s:
         codes = [m[1] for m in re.finditer(r"\(\s*(" + CLASS_CODE + r")\s*[()]", s)]
+        if not codes:
+            # 닫는 괄호가 OCR에서 빠진 행 이름: '수수료후취-온라인슈퍼형(S'
+            codes = [m[1] for m in re.finditer(r"\(\s*(" + CLASS_CODE + r")\s*$", s)]
         # 표 제목 형식: '…[채권]_S-P(수수료미징구-온라인슈퍼-개인연금)'
         codes += [m[1] for m in re.finditer(r"_\s*(" + CLASS_CODE + r")\s*\(", s)]
     if not codes:
         m = re.match(r"(?:종류|클래스|class)?\s*(" + CLASS_CODE + r")(?:형|클래스)?(?=\s|$|\(\s*수수료)", s, re.I)
         if m and (len(s) <= 6 or "수수료" in s or re.match(r"종류|클래스|class", s, re.I)):
+            codes = [m[1]]
+        # 코드 뒤에 한글 구분만 괄호로 붙은 행 이름: 'S-P2(연금저축)', 'C-P(퇴직연 금) 수수료미징구…'
+        m = None if codes else re.match(r"(" + CLASS_CODE + r")\s*\(\s*(?:연\s*금|퇴\s*직|개\s*인|저\s*축|기\s*관|고\s*액|랩|무\s*권\s*유|온\s*라\s*인|오\s*프)"
+                                      r"[가-힣\s]{0,10}(?:\)|$)", s)
+        if not m and not codes and "수수료" in s:
+            # 설명 뒤에 괄호 없이 코드만 붙은 행 이름: '수수료후취-온라인슈퍼 S'
+            m = re.search(r"^수수료[가-힣\-\s]+?\s(" + CLASS_CODE + r")$", s)
+        if m:
+            codes = [m[1]]
+    if not codes and "투자신탁" in s:
+        # 펀드 이름 뒤에 붙은 클래스: '…자투자신탁 1 호(주식)S-P' (설정일이 붙어 읽힌 경우도).
+        m = re.search(r"투자신탁[^()\[\]]{0,12}[\[(][가-힣\-]{1,10}[\])]\s*(" + CLASS_CODE
+                      + r")\s*(?:\(\s*%\s*\))?\s*(?:(?:19|20)\d{2}[-./]\d{2}[-./]\d{2})?$", s)
+        if m:
             codes = [m[1]]
     codes = list(dict.fromkeys(re.sub(r"\s+", "", c) for c in codes))
     if not codes:
@@ -243,7 +276,11 @@ class Document:
     def continuation_headers(self, n):
         seen = {n["id"]}
         prior = self.by_id.get(n.get("continued_from"))
-        while prior and prior["id"] not in seen and prior.get("n_cols") == n.get("n_cols"):
+        # 열 번호로 머리글을 물려받으므로 열 수뿐 아니라 열 경계 위치도 같아야 한다
+        # (열 수만 같고 경계가 어긋난 표에서 번호로 이으면 옆 열 머리글이 붙는다).
+        while prior and prior["id"] not in seen and prior.get("n_cols") == n.get("n_cols") and (
+                not prior.get("col_edges") or not n.get("col_edges") or all(
+                    abs(x - y) <= 5 for x, y in zip(prior["col_edges"], n["col_edges"]))):
             seen.add(prior["id"])
             yield prior
             prior = self.by_id.get(prior.get("continued_from"))
@@ -336,6 +373,45 @@ def table_class(doc, n):
     return None if code == "?" else code
 
 
+def class_descriptions(doc):
+    """문서 안의 '수수료…(코드)' 표기에서 클래스 설명 -> 코드 집합."""
+    if getattr(doc, "_class_desc", None) is None:
+        found = {}
+        for _, raw in doc.texts:
+            for m in re.finditer(r"(수수료[가-힣,\-]+?)\((" + CLASS_CODE + r")\)", compact(raw)):
+                found.setdefault(m[1].strip("-"), set()).add(norm_class(m[2]))
+        doc._class_desc = found
+    return doc._class_desc
+
+
+def restore_lost_codes(doc, entries):
+    """OCR이 클래스 코드를 지운 행 이름 '수수료후취-온라인슈퍼()'은 같은 문서에서 같은 설명에 붙은
+    코드가 하나뿐일 때만 그 코드로 읽는다 (빈 괄호가 있을 때만)."""
+    result = []
+    for c, cp, rp in entries:
+        # 괄호 안이 비었거나 코드가 될 수 없는 숫자뿐인 경우('(5)': OCR이 S를 5로 읽음)
+        m = re.fullmatch(r"(수수료[가-힣,\-]+?)\(\d?\)", compact(rp))
+        if m and class_code(rp) is None:
+            codes = class_descriptions(doc).get(m[1].strip("-"), set())
+            if len(codes) == 1:
+                rp = m[1] + "(" + next(iter(codes)) + ")"
+        result.append((c, cp, rp))
+    return result
+
+
+def merged_class_row(kind, rp, target):
+    """'수수료미징구-온라인슈퍼-개인연금(S-P) 비교지수', '종류모 비교지수': 펀드 행과 그 아래 비교지수 행
+    이름이 한 칸에 합쳐지고 값은 한 줄뿐이면 그 값은 앞 펀드 행의 값이다. 받은 클래스가 있을 때만 쓴다.
+    받은 클래스로 확인되면 펀드 행, 아니면 버린다 (비교지수로 읽지 않는다)."""
+    if not target or kind != "benchmark_returns":
+        return kind
+    m = re.fullmatch(r"(.+?)비교지수(?:수익률)?(?:\(%\))?", compact(rp))
+    # 앞부분이 클래스 행('…(S-P)')이나 모펀드 행('종류모')일 때만 합친 행으로 본다.
+    if not m or "투자신탁" in m[1] or not (class_code(m[1]) or re.search(r"(?:종류)?모(?:펀드)?$", m[1])):
+        return kind
+    return "returns" if norm_class(class_code(m[1])) == target else None
+
+
 def class_kind(kind, rp, target, has_target, table_code=None):
     """Apply share-class rules after row_kind; ETF rows (no class code) are unchanged.
 
@@ -355,8 +431,53 @@ def class_kind(kind, rp, target, has_target, table_code=None):
     return kind
 
 
+def target_group(doc, n, target):
+    """받은 클래스 행 바로 아래의 비교지수·변동성 행 {(표 id, 행, 종류)}. 없으면 None.
+
+    클래스별 성과표는 '클래스 행 / 비교지수 / 수익률 변동성'이 묶음으로 반복된다. 클래스마다 설정일이
+    달라 비교지수의 3년·5년·설정 이후 값도 다르므로 받은 클래스 묶음의 행만 그 클래스 값으로 본다.
+    다음 클래스·펀드 행이 나오면 묶음이 끝난다. 쪽을 넘어 이어진 표까지 따라간다.
+    """
+    root = n
+    seen = {root["id"]}
+    while doc.by_id.get(root.get("continued_from")) and root["continued_from"] not in seen:
+        root = doc.by_id[root["continued_from"]]
+        seen.add(root["id"])
+    chain, current = [root], root
+    seen = {root["id"]}
+    while True:
+        nxt = next((t for t in doc.tables if t.get("continued_from") == current["id"] and t["id"] not in seen), None)
+        if not nxt:
+            break
+        chain.append(nxt)
+        seen.add(nxt["id"])
+        current = nxt
+    rows = []
+    for t in chain:
+        for r, row in enumerate(t.get("grid", [])):
+            label = next((x for x in row if x and number(x) is None), "")
+            if label:
+                rows.append((t, r, label))
+    group, inside = set(), False
+    for t, r, label in rows:
+        rp = restore_lost_codes(doc, [(None, None, label)])[0][2]
+        kind = merged_class_row(row_kind(rp), rp, target)
+        if kind in ("benchmark_returns", "volatility"):
+            if inside:
+                group.add((t["id"], r, kind))
+            continue
+        # 비교지수·변동성이 아닌 행(다른 클래스, 코드가 지워진 클래스, 펀드 행)에서 묶음이 끝난다.
+        if inside:
+            break
+        code = row_class(doc, t, r, rp)
+        inside = bool(code) and norm_class(code) == target
+    # 묶음에 자기 행이 없으면(비교지수·변동성을 펀드 전체 행 아래에 한 번만 싣는 표) 기존 규칙에 맡긴다.
+    return group or None
+
+
 def performance(doc, out, target=None):
     candidates = []
+    header_only = {}
     for n in doc.tables:
         text = compact(" ".join(c.get("text", "") for c in n.get("cells", [])))
         ctx = doc.context(n)
@@ -374,6 +495,10 @@ def performance(doc, out, target=None):
             continue
         es = list(doc.entries(n))
         if not any(horizon(cp) for _, cp, _ in es):
+            if target and any(t.get("continued_from") == n["id"] for t in doc.tables):
+                # 머리글만 남은 표(값 행은 모두 다음 쪽): 이어진 표를 읽도록 날짜만 기억한다.
+                hdr = dates(" ".join(x for row in n.get("grid", []) for x in row if x))
+                header_only[n["id"]] = (max(hdr, default=""), -n.get("page", 0), n, [])
             continue
         ds = dates(" ".join(cp for _, cp, _ in es))
         title_date = doc.returns_date(n)
@@ -383,6 +508,7 @@ def performance(doc, out, target=None):
     if target:
         # 받은 클래스 행은 다음 쪽으로 이어진 표에 있는 경우가 많다. 앞 표와 같은 날짜로 본다.
         picked = {x[2]["id"]: x for x in candidates}
+        picked.update({k: v for k, v in header_only.items() if k not in picked})
         for n in doc.tables:
             prior = picked.get(n.get("continued_from"))
             if prior and n["id"] not in picked:
@@ -402,6 +528,13 @@ def performance(doc, out, target=None):
                     out["dates"]["inception_date"] = evidence(dates(row[col])[0], n, row[col])
                     break
     latest_date = max((x[0] for x in candidates), default="")
+    groups = {}
+    if target:
+        for disclosed, _, n, _ in candidates:
+            if disclosed == latest_date:
+                groups[n["id"]] = target_group(doc, n, target)
+    # 받은 클래스 묶음에 그 종류의 행이 있으면 그 행만 쓴다. 요약표 등 다른 표의 같은 종류 행은 쓰지 않는다.
+    own_kinds = {k for g in groups.values() if g for _, _, k in g}
     for disclosed, _, n, es in sorted(candidates, key=lambda x: x[:2], reverse=True):
         if disclosed != latest_date:
             continue
@@ -409,6 +542,8 @@ def performance(doc, out, target=None):
         fund_rows = sorted({c["r"] for c, cp, rp in es if horizon(cp)
                             and "투자신탁" in compact(rp)})
         tcode = table_class(doc, n) if target else None
+        if target:
+            es = restore_lost_codes(doc, es)
         has_target = bool(target) and (norm_class(tcode) == target or
                                        any(norm_class(class_code(rp)) == target for _, _, rp in es))
         for c, cp, rp in es:
@@ -418,7 +553,11 @@ def performance(doc, out, target=None):
             kind = row_kind(rp)
             if "비교지수" in compact(rp) and "투자신탁" in compact(rp) and len(fund_rows) >= 2:
                 kind = "returns" if c["r"] == fund_rows[0] else "benchmark_returns"
+            kind = merged_class_row(kind, rp, target)
             kind = class_kind(kind, rp, target, has_target, tcode)
+            if target and kind in ("benchmark_returns", "volatility"):
+                if kind in own_kinds and (n["id"], c["r"], kind) not in (groups.get(n["id"]) or ()):
+                    continue  # 받은 클래스 묶음 밖의 비교지수·변동성 행
             if kind and out[kind][h] is None:
                 out[kind][h] = evidence(float(number(c["text"])), n, c["text"])
                 ds = dates(cp)
@@ -428,16 +567,24 @@ def performance(doc, out, target=None):
                 elif out[kind]["as_of_date"] is None:
                     out[kind]["as_of_date"] = doc.returns_date(n)
 
-    annual = {}
+    annual, annual_groups = {}, {}
     for n in doc.tables:
         ctx = doc.context(n)
         text = compact(" ".join(c.get("text", "") for t in (n, *doc.continuation_headers(n))
                                 for c in t.get("cells", [])))
-        if not ("연도별수익률" in ctx or ("년차" in text and any(x in text for x in ("비교지수", "기초지수")))):
+        if not ("연도별수익률" in ctx or ("년차" in text and any(x in text for x in ("비교지수", "기초지수")))
+                or (target and "운용실적" in ctx and re.search(r"최근\d+년차", text))):
             continue
         title_date = doc.returns_date(n)
         entries = list(doc.entries(n))
+        annual_date = title_date
+        # Merged period columns can already claim the inferred year. Leave
+        # those ambiguous tables to the existing rules rather than collide.
+        if target and not annual_date and not any(len(dates(cp)) > 2 for _, cp, _ in entries):
+            annual_date = out["returns"]["as_of_date"] or out["dates"]["as_of_date"]
         tcode = table_class(doc, n) if target else None
+        if target:
+            entries = restore_lost_codes(doc, entries)
         has_target = bool(target) and (norm_class(tcode) == target or
                                        any(norm_class(class_code(rp)) == target for _, _, rp in entries))
         for c, cp, rp in entries:
@@ -447,25 +594,42 @@ def performance(doc, out, target=None):
             ym = re.search(r"(?:19|20)\d{2}(?=년|\b)", cp)
             inferred = False
             nth = re.search(r"최근\s*(\d+)\s*년차", cp)
-            if not ds and not ym and nth and title_date:
-                as_of = dt.date.fromisoformat(value(title_date))
+            count = int(nth[1]) if nth else 0
+            # A single start date (or a cut-off, zero-padded end date) does
+            # not identify the reporting year. Use the disclosed as-of date
+            # only for the target class's most recent two annual columns.
+            incomplete = bool(ds) and len(ds) < 2
+            if target and annual_date and 1 <= count <= 2:
+                end = dt.date.fromisoformat(value(annual_date))
+                short = re.search(r"(?<!\d)(\d{4})/(\d{2})/(\d)\s*$", cp)
+                if short:
+                    expected = f"{end.year - count + 1:04d}/{end.month:02d}/{end.day:02d}"
+                    incomplete |= end.day >= 10 and expected.startswith(short[0].strip())
+            if nth and annual_date and ((not ds and not ym and (title_date or 1 <= count <= 2)) or
+                    (target and 1 <= count <= 2 and incomplete)):
+                as_of = dt.date.fromisoformat(value(annual_date))
                 def years_before(n):
                     year = as_of.year - n
                     return as_of.replace(year=year, day=min(as_of.day, calendar.monthrange(year, as_of.month)[1]))
-                count = int(nth[1])
                 if count < 1:
                     continue
-                ds = [(years_before(count) + dt.timedelta(days=1)).isoformat(), years_before(count - 1).isoformat()]
+                end = years_before(count - 1).isoformat()
+                start = ds[0] if ds and ds[0] <= end else (years_before(count) + dt.timedelta(days=1)).isoformat()
+                ds = [start, end]
                 inferred = True
             year = max(ds)[:4] if ds else ym[0] if ym else None
-            kind = row_kind(rp)
+            kind = merged_class_row(row_kind(rp), rp, target)
             fallback = kind is None
             kind = class_kind(kind, rp, target, has_target, tcode)
             if not year or kind not in ("returns", "benchmark_returns"):
                 continue
+            if target and kind == "benchmark_returns":
+                group = annual_groups.setdefault(n["id"], target_group(doc, n, target))
+                if group and (n["id"], c["r"], kind) not in group:
+                    continue  # 받은 클래스 묶음 밖의 비교지수 행
             hn, raw = doc.header_raw(n, c, cp)
             if inferred:
-                hn, raw = n, cp + " | " + title_date["raw"]
+                hn, raw = n, cp + " | " + annual_date["raw"]
             item = annual.setdefault(year, {"year": evidence(int(year), hn, raw),
                                            "fund": None, "benchmark": None, "period": None})
             key = "fund" if kind == "returns" else "benchmark"
@@ -479,7 +643,7 @@ def performance(doc, out, target=None):
 
 def row_class(doc, n, r, rp):
     """class_code, plus a label split at a page break: '수수료후취-온라인슈퍼' | 다음 쪽 '(S)'."""
-    code = class_code(rp)
+    code = class_code(rp) or class_code(restore_lost_codes(doc, [(None, None, rp)])[0][2])
     if code or "수수료" not in rp or r != len(n.get("grid", [])) - 1:
         return code
     for nxt in doc.tables:
@@ -515,7 +679,9 @@ def merged_role(n, c, h):
     같은 글자의 머리글 칸이 역할 수만큼 나란히 있으면 순서대로 나눈다. 아니면 None.
     """
     roles = fee_roles(h.get("text"))
-    cols = sorted({col for x in n.get("cells", []) if x["r"] == h["r"] and x.get("text") == h.get("text")
+    # 같은 글자인지는 문장부호와 OCR 오타를 빼고 비교한다 ('판매회사수탁회사 –보주' / '판매회사수탁회사 보주').
+    cols = sorted({col for x in n.get("cells", []) if x["r"] == h["r"]
+                   and fix_header_typos(x.get("text")) == fix_header_typos(h.get("text"))
                    for col in range(x["c"], x["c"] + x.get("cs", 1))})
     if len(roles) >= 2 and len(cols) == len(roles) and cols == list(range(cols[0], cols[0] + len(cols))):
         return roles[cols.index(c["c"])]
@@ -570,10 +736,48 @@ def bare_role(n, h):
     return BARE_ROLES[text] if len(roles) >= 3 else None
 
 
+MERGED_HEAD = re.compile(r"(?:집합투자(?:업자)?|판매회사|지정참가(?:회사)?|신탁업자|수탁회사|일반사무(?:관리회사)?|사무관리(?:회사)?|보수)+")
+FRAGMENT_HEAD = re.compile(r"(?:업자|회사)?보수")
+
+
+def spread_role(n, c, h):
+    """OCR이 이웃 머리글 윗줄을 한 칸에 이어 붙인 경우: '업자 보수 | 집합투자판매회사수탁회사 보수 | 보수'.
+
+    붙은 칸의 역할 이름(운용·판매·수탁)을 읽은 순서대로 그 칸과 양옆 칸에 하나씩 나눈다.
+    붙은 칸이 역할 이름과 '보수'로만 되어 있고, 나눌 칸들이 비었거나 '보수'·'업자 보수' 같은
+    조각뿐이며, 그렇게 맞는 자리가 하나뿐일 때만 쓴다. 다른 규칙이 못 정한 칸에만 쓴다.
+    """
+    row = {x["c"]: x for x in n.get("cells", []) if x["r"] == h["r"] and x.get("header") and x.get("cs", 1) == 1}
+
+    def fragment(x):
+        text = compact((x or {}).get("text"))
+        return x is not None and (not text or bool(FRAGMENT_HEAD.fullmatch(text)))
+
+    found = []
+    for k, x in row.items():
+        text = compact(x.get("text"))
+        roles = fee_roles(text)
+        if len(roles) < 2 or "보수" not in text or not MERGED_HEAD.fullmatch(text):
+            continue
+        windows = [s for s in range(k - len(roles) + 1, k + 1)
+                   if all(j == k or fragment(row.get(j)) for j in range(s, s + len(roles)))]
+        if len(windows) == 1 and windows[0] <= c["c"] < windows[0] + len(roles):
+            found.append(roles[c["c"] - windows[0]])
+    return found[0] if len(found) == 1 else None
+
+
 def class_qualified(label, target):
     """받은 클래스 코드 바로 뒤에 한글 괄호 구분이 붙었는지 (예: 'S-P (퇴직)', '(S-P(퇴직))')."""
     return any(norm_class(m[1]) == target for m in re.finditer(
         r"(?<![A-Za-z])(" + CLASS_CODE + r")\s*\(\s*(?!수수료)[가-힣]", label or ""))
+
+
+def trading_rate_row(label, c):
+    """뒤집힌 보수표의 '증권거래비용' 행. 비율(소수)만 받고 금액(천원, '17,605')은 받지 않는다."""
+    s = re.sub(r"[·ㆍᆞ•∙・]", "", compact(label))
+    v = number(c.get("text"))
+    return (any(x in s for x in ("매매중개", "증권거래비용", "매매수수료"))
+            and isinstance(v, float) and 0 <= v < 5 and "," not in str(c.get("text")))
 
 
 def costs(doc, out, target=None):
@@ -621,7 +825,7 @@ def costs(doc, out, target=None):
         if not target or norm_class(row_class(doc, n, c["r"], rp)) == target:
             return True
         # 뒤집힌 표: 클래스가 열 머리글에 있고 행은 보수 이름(집합투자업자보수 …)이다.
-        if (class_code(rp) is None and fee_key(rp)
+        if (class_code(rp) is None and (fee_key(rp) or trading_rate_row(rp, c))
                 and any(norm_class(class_code(p)) == target for p in (c.get("col_path") or []))):
             return True
         # 모든 클래스에 같은 값이라 세로로 합쳐진 칸은 덮는 행 중에 받은 클래스가 있으면 쓴다.
@@ -637,7 +841,7 @@ def costs(doc, out, target=None):
             return None
         ht, h = heads[-1]
         if (n["id"], c["r"], c["c"]) in merged:
-            return merged_role(ht, c, h)
+            return merged_role(ht, c, h) or spread_role(ht, c, h)
         key = ((strict and fee_key(h.get("text", ""))) or fee_key_loose(h.get("text", ""))
                or (bare_role(ht, h) if target else None))
         if key is None and target:
@@ -651,6 +855,9 @@ def costs(doc, out, target=None):
                 above.sort(key=lambda x: x["r"])
             if above:
                 key = fee_key(compact(above[-1].get("text", "")) + compact(h.get("text", "")))
+        if key is None and target:
+            # 이웃 머리글이 한 칸에 붙어 조각만 남은 칸('업자 보수', '보수')
+            key = spread_role(ht, c, h)
         return key
 
     def put(key, n, c, rp):
@@ -709,9 +916,27 @@ def costs(doc, out, target=None):
             if (n["id"], c["r"], c["c"]) in blocked:
                 continue
             key = inherited_key(n, c, strict=bool(target) or n in extra)
+            # '총보수 및 비용' includes 기타비용; the legacy matcher reads
+            # it as 총보수. Keep that pass's values and fill only a blank TER.
+            if target and key == "total" and "총보수및비용" in compact(cp):
+                key = "ter"
             if key and out["fees"][key] is None:
                 put(key, n, c, rp)
     return fee_rows
+
+
+DATE_RANGE_RE = re.compile(r"\d{4}[.]\d{1,2}[.]\d{1,2}[.]?\s*[-–]\s*\d{4}[.]\d{1,2}[.]\d{1,2}")
+
+
+def compact_dates(text):
+    """Stand-alone yyyymmdd period headers ('20251231')."""
+    found = []
+    for m in re.finditer(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", str(text)):
+        try:
+            found.append(dt.date(*map(int, m.groups())).isoformat())
+        except ValueError:
+            pass
+    return [d for d in found if "1990" <= d[:4] <= "2100"]
 
 
 def financials(doc, out):
@@ -737,10 +962,13 @@ def financials(doc, out):
                     break
             if label == "순자산":
                 key = "net_assets"
-            ds = dates(cp)
+            # '20251231'처럼 붙여 쓴 날짜는 다른 날짜 형식이 없을 때만 읽는다.
+            ds = dates(cp) or compact_dates(cp)
             # Multiple fiscal dates in a single OCR header are ambiguous unless
-            # they form one explicitly delimited reporting interval.
-            if len(set(ds)) > 1 and (not re.search(r"[~∼〜]", cp) or len(set(ds)) > 2):
+            # they form one explicitly delimited reporting interval
+            # ('~', or '-' directly between two full dates: 2025.1.1-2025.12.31).
+            interval = re.search(r"[~∼〜]", cp) or DATE_RANGE_RE.search(cp)
+            if len(set(ds)) > 1 and (not interval or len(set(ds)) > 2):
                 continue
             if key is None or not ds:
                 continue
@@ -797,7 +1025,13 @@ def history(doc, out):
     out["asset_history"] = [rows[p] for p in sorted(rows, key=lambda s: s.split("/")[-1], reverse=True)] or None
 
 
-FUND_TYPE_LABEL = r"(?:주식혼합|채권혼합|재간접|주식|채권|혼합)(?:형)?"
+FUND_TYPE_LABEL = r"(?:주식혼합|채권혼합|재간접|주식|채권|혼합)(?:-?(?:파생|재간접))?(?:형)?"
+
+
+def type_label(raw):
+    """'주식' -> '주식형'; '주식-파생형' and '주식파생형' -> '주식파생형' (hyphen dropped like '채권혼합')."""
+    label = raw.replace("-", "")
+    return label if label.endswith("형") else label + "형"
 
 
 def fund_type_evidence(doc, fund_name):
@@ -809,17 +1043,17 @@ def fund_type_evidence(doc, fund_name):
                 for raw in row:
                     m = re.search(pattern, compact(raw))
                     if m:
-                        label = m[1] if m[1].endswith("형") else m[1] + "형"
+                        label = type_label(m[1])
                         return evidence("증권(" + label + ")", n, raw)
     for n, raw in doc.texts:
         m = re.search(pattern, compact(raw))
         if m:
-            label = m[1] if m[1].endswith("형") else m[1] + "형"
+            label = type_label(m[1])
             return evidence("증권(" + label + ")", n, raw)
     if fund_name:
         m = re.search(r"[\[(](" + FUND_TYPE_LABEL + r")[\])]$", compact(value(fund_name)))
         if m:
-            label = m[1] if m[1].endswith("형") else m[1] + "형"
+            label = type_label(m[1])
             return {**fund_name, "value": "증권(" + label + ")"}
     return None
 
@@ -842,6 +1076,60 @@ def benchmark_name(raw):
     if depth:
         return None
     return re.sub(r"(?:100(?:\.0+)?|\d{1,2}(?:\.\d+)?)%$", "", raw[:end].strip()).strip()
+
+
+def formula_head(raw):
+    """First index of a weighted formula: '[A x 30%] + …' / '(A × 95%) + …' -> A."""
+    s = re.sub(r"^[\s\-·•※*→]+", "", str(raw)).strip()
+    pairs = {"[": "]", "(": ")", "{": "}"}
+    if s[:1] in pairs:
+        end = s.find(pairs[s[0]])
+        s = s[1:end] if end > 0 else s[1:]
+    s = re.split(r"\s*[×x*]\s*\(?\d|\s*\(\d+(?:\.\d+)?%\)|\(비교지수|\s+\d+(?:\.\d+)?%", s, maxsplit=1)[0]
+    name = benchmark_name(s.strip())
+    if not name:
+        return None
+    name = name.strip(" []{}")
+    if (2 <= len(name) <= 65 and re.search(r"[A-Za-z가-힣]", name)
+            and not re.search(r"합니다|습니다|투자신탁|없음|해당|사용하고|수익률|변경|선정|하여|[.:：]$", name)):
+        return name
+    return None
+
+
+BENCH_LABEL = r"(?:기초\s*지수|추적\s*대상\s*지수|비교\s*지수)(?:\s*\([^)]*지수\))?\s*[:：]"
+
+
+def benchmark_fallback(doc):
+    """Only when the labelled rules found nothing: formulas, label/heading on its own line, quoted names."""
+    texts = doc.texts
+    for i, (n, raw) in enumerate(texts):
+        flat = str(raw).replace("\n", " ")
+        s = compact(raw)
+        nxt = texts[i + 1] if i + 1 < len(texts) and texts[i + 1][0] is not n else None
+        m = re.search(BENCH_LABEL + r"\s*(.*)", flat)
+        if m:
+            if m[1].strip():
+                name = formula_head(m[1][:120])
+                if name:
+                    return evidence(name, n, raw)
+            elif nxt and len(compact(nxt[1])) <= 120:
+                # '※ 비교지수:' alone; the formula is the next line.
+                name = formula_head(nxt[1])
+                if name:
+                    return evidence(name, nxt[0], nxt[1])
+            continue
+        # '(3)투자신탁의 비교지수(벤치마크)' heading followed by '- KOSPI 100%'.
+        if (re.fullmatch(r"(?:\(?\d+\)|\d+[.)]|[가-하][.)])?(?:투자신탁의)?비교지수(?:\(벤치마크\))?", s)
+                and nxt and re.match(r"\s*[-·•]", nxt[1]) and len(compact(nxt[1])) <= 120):
+            name = formula_head(nxt[1])
+            if name:
+                return evidence(name, nxt[0], nxt[1])
+        m = re.search(r'''비교지수를\s*["“‘']([^"”’']{2,80})["”’']\s*(?:으로|로)''', flat)
+        if m:
+            name = formula_head(m[1])
+            if name:
+                return evidence(name, n, raw)
+    return None
 
 
 def inception_period(tail):
@@ -887,16 +1175,29 @@ def identity_classification(doc, out):
     source = doc.data.get("source", {})
     raw = source.get("file") if isinstance(source, dict) else source
     ident["source"] = {"value": raw, "page": None, "node": "source.file", "raw": raw} if raw else None
-    for n, raw in doc.texts:
+    def name_like(text):
+        # 펀드 이름 모양인지 본다. 안내 문장(…있습니다)이나 쉼표·문장부호로 시작하는 조각은 이름이 아니다.
+        return (("투자" in text or "MMF" in text.upper()) and not re.match(r"[^\w\[(]", text)
+                and not re.search(r"합니다|바랍니다|습니다|사항|명칭", text))
+
+    for i, (n, raw) in enumerate(doc.texts):
         s = compact(raw)
         if not out["risk_grade"]:
             m = re.search(r"투자위험등급[:：]?([1-6])등급|([1-6])등급으로분류", s)
             if m:
                 out["risk_grade"] = evidence(int(m[1] or m[2]), n, raw)
         if not ident["fund_name"]:
-            m = re.search(r"집합투자기구(?:의)?명칭[:：]?(.{3,100}?)(?=\d[.]|집합투자업자|한국금융|$)", s)
-            if m and "투자" in m[1] and not re.search(r"합니다|바랍니다|사항|명칭", m[1]):
+            # 다음 항목 번호(2.)에서 끊되 이름 속 소수(4.0)에서는 끊지 않는다.
+            m = re.search(r"집합투자기구(?:의)?명칭[:：]?(.{3,100}?)(?=\d[.](?!\d)|집합투자업자|한국금융|$)", s)
+            if m and name_like(m[1].strip(":")):
                 ident["fund_name"] = evidence(m[1].strip(":"), n, raw)
+            elif re.fullmatch(r"(?:\d+[.])?집합투자기구(?:의)?명칭", s):
+                # 항목 이름만 있는 줄이면 이름은 바로 뒤 칸이나 줄에 있다.
+                for n2, raw2 in doc.texts[i + 1:i + 5]:
+                    s2 = compact(raw2)
+                    if len(s2) <= 100 and re.search(r"투자신탁|투자회사|MMF", s2) and name_like(s2) and "모투자신탁" not in s2:
+                        ident["fund_name"] = evidence(s2, n2, raw2)
+                        break
             # A short stand-alone fund-name cell is another title-page source.
             elif len(s) <= 90 and re.fullmatch(r"[가-힣A-Za-z0-9+&()\[\]·-]+(?:증권)?상장지수(?:증권)?투자신탁[\[(][가-힣]+[\])]", s):
                 if not s.startswith("증권상장"):
@@ -941,6 +1242,24 @@ def identity_classification(doc, out):
                 name = benchmark_name(m[1])
                 if name and len(name) <= 65 and not re.search(r"합니다|투자신탁|없음|사용하고|수익률|변경|선정|하여", name):
                     cls["benchmark_index"] = evidence(name, n, raw)
+    if cls["benchmark_index"] is None:
+        cls["benchmark_index"] = benchmark_fallback(doc)
+        # '비교지수가 시장에 존재하지 않으므로 …'처럼 비교지수가 없다는 안내 문장은 지수 이름이 아니다.
+        if cls["benchmark_index"] and re.search(r"존재하지|않으므로|않습니다|없으므로|없습니다|집합투자기구는",
+                                                compact(value(cls["benchmark_index"]))):
+            cls["benchmark_index"] = None
+    if cls["benchmark_index"] is None:
+        # 표 테두리 안에 있는 '주1) 비교지수 : …' 주석은 표의 notes에 들어간다. 다른 규칙이 못 찾았을 때만 읽는다.
+        for table in doc.tables:
+            for note in table.get("notes", []):
+                raw = note.get("text", "")
+                m = re.search(r"비교\s*지수\s*[:：]\s*([A-Za-z가-힣0-9][A-Za-z가-힣0-9&+().,/_% -]{1,65})", raw.replace("\n", " "))
+                name = benchmark_name(m[1]) if m else None
+                if name and len(name) <= 65 and not re.search(r"합니다|투자신탁|없음|사용하고|수익률|변경|선정|하여", name):
+                    cls["benchmark_index"] = evidence(name, table, raw)
+                    break
+            if cls["benchmark_index"] is not None:
+                break
     cls["fund_type"] = fund_type_evidence(doc, ident["fund_name"])
     # A labelled 100% index target establishes 1x; absence of leverage wording
     # alone does not establish a multiplier.
@@ -1123,6 +1442,17 @@ def coverage_values(record):
     return result
 
 
+def values_only(data):
+    """출처(page, node, raw)를 뺀 값만 남긴다. 원 환산값이 있으면 {value, value_krw}로 둔다."""
+    if isinstance(data, dict) and "value" in data:
+        return {"value": data["value"], "value_krw": data["value_krw"]} if "value_krw" in data else data["value"]
+    if isinstance(data, dict):
+        return {k: values_only(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [values_only(v) for v in data]
+    return data
+
+
 def rebuild_datalake(output=OUTPUT):
     """Rebuild only from fields.json whose corresponding OCR document exists."""
     paths = [p.with_name(p.name.removesuffix(".ocr_structure.json") + ".fields.json")
@@ -1131,19 +1461,18 @@ def rebuild_datalake(output=OUTPUT):
     records = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in paths if p.is_file()]
     lake = output / "datalake"
     lake.mkdir(parents=True, exist_ok=True)
-    (lake / "etf_fields.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False, allow_nan=False) + "\n" for _, r in records), encoding="utf-8")
+    # 데이터레이크에는 값만 둔다. 출처(쪽·노드·원래 글자)는 문서별 fields.json에 남아 있다.
+    (lake / "etf_fields.jsonl").write_text("".join(json.dumps(values_only(r), ensure_ascii=False, allow_nan=False) + "\n"
+                                                   for _, r in records), encoding="utf-8")
     flat = [flatten(r) for _, r in records]
     keys = list(dict.fromkeys(k for row in flat for k in row))
-    # CSV는 값과 쪽만 둔다 (노드 ID와 원래 글자는 문서별 fields.json에 남아 있다).
-    # 원 환산값은 원래 값과 같은 쪽에서 나오므로 쪽 컬럼을 따로 두지 않는다.
-    columns = [part for k in keys for part in ((k,) if k.endswith(".value_krw") else (k, k + ".page"))]
+    # CSV도 값만 둔다 (쪽·노드 ID·원래 글자는 문서별 fields.json에 남아 있다).
+    columns = keys
     with (lake / "etf_fields.csv.raw").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for row in flat:
-            writer.writerow({col: val for k, item in row.items() if item is not None
-                             for col, val in ((k, item["value"]), (k + ".page", item["page"]))
-                             if col in columns})
+            writer.writerow({k: item["value"] for k, item in row.items() if item is not None})
     # 컬럼 사전: CSV 컬럼마다 한국어 설명과 단위
     with (lake / "etf_fields_columns.csv.raw").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
